@@ -228,16 +228,17 @@ export default {
         await logAudit(env, 'schedule', schedule_id, 'payment_recorded',
           { amount_ugx, payment_method, reference });
 
-        // Unlock when no pending/overdue schedules remain for this device
-        const remaining = await env.DB.prepare(
-          `SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status IN ('pending','overdue')`
+        // Option B: unlock when no overdue schedules remain.
+        // Future 'pending' installments do NOT block the unlock.
+        const overdueLeft = await env.DB.prepare(
+          `SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`
         ).bind(schedule.device_imei).first();
 
         let unlocked = false;
-        if (remaining.cnt === 0) {
+        if (overdueLeft.cnt === 0) {
           await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`)
             .bind(schedule.device_imei).run();
-          await queueCommand(env, schedule.device_imei, 'UNLOCK', 'payment_received');
+          await queueCommand(env, schedule.device_imei, 'UNLOCK', 'overdue_cleared');
           unlocked = true;
         }
 
@@ -245,7 +246,7 @@ export default {
           success: true,
           schedule_status: newStatus,
           device_unlocked: unlocked,
-          remaining_installments: remaining.cnt,
+          overdue_remaining: overdueLeft.cnt,
         });
       }
 
