@@ -1,4 +1,4 @@
-CREATE TABLE devices (
+CREATE TABLE IF NOT EXISTS devices (
   imei TEXT PRIMARY KEY,
   customer_name TEXT NOT NULL,
   customer_phone TEXT,
@@ -7,7 +7,7 @@ CREATE TABLE devices (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE payment_plans (
+CREATE TABLE IF NOT EXISTS payment_plans (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   plan_name TEXT,
   total_amount_ugx REAL,
@@ -16,7 +16,7 @@ CREATE TABLE payment_plans (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE schedules (
+CREATE TABLE IF NOT EXISTS schedules (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   device_imei TEXT REFERENCES devices(imei),
   plan_id INTEGER REFERENCES payment_plans(id),
@@ -28,11 +28,35 @@ CREATE TABLE schedules (
   UNIQUE(device_imei, installment_number)
 );
 
-CREATE TABLE transactions (
+CREATE TABLE IF NOT EXISTS transactions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   schedule_id INTEGER REFERENCES schedules(id),
   amount_ugx REAL,
   payment_method TEXT,
   reference TEXT,
   paid_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS commands (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_imei TEXT REFERENCES devices(imei),
+  command TEXT NOT NULL,
+  reason TEXT,
+  status TEXT DEFAULT 'queued',
+  payload TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  sent_at DATETIME,
+  acknowledged_at DATETIME
+);
+
+CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status);
+CREATE INDEX IF NOT EXISTS idx_commands_device ON commands(device_imei);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity TEXT,
+  entity_id TEXT,
+  action TEXT,
+  details TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
