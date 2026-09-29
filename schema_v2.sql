@@ -1,0 +1,2 @@
+ALTER TABLE commands ADD COLUMN attempts INTEGER DEFAULT 0;
+ALTER TABLE commands ADD COLUMN error_message TEXT;

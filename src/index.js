@@ -1,3 +1,5 @@
+import { sendFcm } from './fcm.js';
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -34,7 +36,53 @@ async function queueCommand(env, imei, command, reason) {
   ).bind(imei, command, reason, payload).run();
 
   await logAudit(env, 'command', result.meta.last_row_id, 'queued', { imei, command, reason });
+
+  // Fire-and-forget FCM dispatch. Failures are logged to the command row.
+  try { await dispatchPendingCommands(env, 5); } catch (_) {}
+
   return { id: result.meta.last_row_id, deduplicated: false };
+}
+
+async function dispatchPendingCommands(env, limit = 50) {
+  const rows = await env.DB.prepare(
+    `SELECT c.*, d.fcm_token FROM commands c
+     JOIN devices d ON c.device_imei = d.imei
+     WHERE c.status = 'queued'
+     ORDER BY c.created_at ASC
+     LIMIT ?`
+  ).bind(limit).all();
+
+  const results = { attempted: 0, sent: 0, failed: 0, skipped_no_token: 0 };
+
+  for (const cmd of rows.results) {
+    results.attempted++;
+
+    if (!cmd.fcm_token) {
+      results.skipped_no_token++;
+      await env.DB.prepare(
+        `UPDATE commands SET attempts = attempts + 1, error_message = 'no_fcm_token' WHERE id = ?`
+      ).bind(cmd.id).run();
+      continue;
+    }
+
+    try {
+      const payload = JSON.parse(cmd.payload || '{}');
+      await sendFcm(env, cmd.fcm_token, payload);
+      await env.DB.prepare(
+        `UPDATE commands SET status = 'sent', sent_at = CURRENT_TIMESTAMP, attempts = attempts + 1, error_message = NULL WHERE id = ?`
+      ).bind(cmd.id).run();
+      await logAudit(env, 'command', cmd.id, 'sent', { imei: cmd.device_imei });
+      results.sent++;
+    } catch (err) {
+      await env.DB.prepare(
+        `UPDATE commands SET attempts = attempts + 1, error_message = ? WHERE id = ?`
+      ).bind(String(err.message || err).slice(0, 500), cmd.id).run();
+      await logAudit(env, 'command', cmd.id, 'send_failed', { error: String(err.message || err) });
+      results.failed++;
+    }
+  }
+
+  return results;
 }
 
 async function detectOverdue(env) {
@@ -193,6 +241,40 @@ export default {
         await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(imei).run();
         const cmd = await queueCommand(env, imei, 'UNLOCK', reason || 'manual');
         return json({ success: true, command_id: cmd.id, deduplicated: cmd.deduplicated });
+      }
+
+
+      // ── Acknowledge command (called by Android app after executing) ──
+      if (path.match(/^\/api\/commands\/\d+\/acknowledge$/) && request.method === 'POST') {
+        const id = Number(path.split('/')[3]);
+        const body = await request.json().catch(() => ({}));
+        await env.DB.prepare(
+          `UPDATE commands SET status = 'acknowledged', acknowledged_at = CURRENT_TIMESTAMP WHERE id = ?`
+        ).bind(id).run();
+        await logAudit(env, 'command', id, 'acknowledged', body || {});
+        return json({ success: true, command_id: id });
+      }
+
+      // ── Test push (send to a raw FCM token) ────────
+      if (path === '/api/admin/test-push' && request.method === 'POST') {
+        const { fcm_token, action, reason } = await request.json();
+        if (!fcm_token) return json({ error: 'fcm_token required' }, 400);
+        try {
+          const resp = await sendFcm(env, fcm_token, {
+            action: action || 'TEST',
+            reason: reason || 'manual_test',
+            ts: Date.now(),
+          });
+          return json({ success: true, fcm_response: resp });
+        } catch (err) {
+          return json({ success: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // ── Manual dispatch flush ──────────────────────
+      if (path === '/api/admin/dispatch-queue' && request.method === 'POST') {
+        const result = await dispatchPendingCommands(env, 100);
+        return json({ success: true, ...result });
       }
 
       // ── Command queue ──────────────────────
