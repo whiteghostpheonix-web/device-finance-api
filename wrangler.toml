@@ -1,0 +1,8 @@
+name = "device-finance-api"
+main = "src/index.js"
+compatibility_date = "2024-10-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "device-finance-db"
+database_id = "de160f9b-e8ed-481d-b08b-a792c4ca5959"
