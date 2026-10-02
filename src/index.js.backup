@@ -1,0 +1,882 @@
+import { sendFcm } from './fcm.js';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, CF-Access-Client-Id, CF-Access-Client-Secret',
+};
+
+
+// Cloudflare Access passes the authenticated user's email in this header
+function getResellerEmail(request) {
+  // CF Access forwards the email on the JWT; the plain email header is exposed
+  // when "Add email to header" is enabled on the Access app.
+  return request.headers.get('cf-access-authenticated-user-email') || null;
+}
+
+// If no email header, it's an automated call (service token / shell) — treat as admin
+function isAdminRequest(request) {
+  return !getResellerEmail(request);
+}
+
+function json(data, status = 200) {
+  return Response.json(data, { status, headers: corsHeaders });
+}
+
+async function logAudit(env, entity, entity_id, action, details) {
+  await env.DB.prepare(
+    `INSERT INTO audit_log (entity, entity_id, action, details) VALUES (?, ?, ?, ?)`
+  ).bind(entity, String(entity_id), action,
+    typeof details === 'string' ? details : JSON.stringify(details)).run();
+}
+
+async function queueCommand(env, imei, command, reason) {
+  // Deduplicate: don't queue another of the same command if one is already pending
+  // Dedupe only if the MOST RECENT command for this device is the same
+  // command AND it hasn't been acknowledged yet.
+  // If a different command (e.g. UNLOCK) came in between, we always send.
+  const lastCommand = await env.DB.prepare(
+    `SELECT id, command, status FROM commands
+     WHERE device_imei = ?
+     ORDER BY id DESC LIMIT 1`
+  ).bind(imei).first();
+
+  const existing = (lastCommand
+    && lastCommand.command === command
+    && (lastCommand.status === 'queued' || lastCommand.status === 'sent'))
+    ? lastCommand
+    : null;
+
+  if (existing) {
+    return { id: existing.id, deduplicated: true };
+  }
+
+  const payload = JSON.stringify({ action: command, reason, ts: Date.now() });
+  const result = await env.DB.prepare(
+    `INSERT INTO commands (device_imei, command, reason, status, payload)
+     VALUES (?, ?, ?, 'queued', ?)`
+  ).bind(imei, command, reason, payload).run();
+
+  await logAudit(env, 'command', result.meta.last_row_id, 'queued', { imei, command, reason });
+
+  // Fire-and-forget FCM dispatch. Failures are logged to the command row.
+  try { await dispatchPendingCommands(env, 5); } catch (_) {}
+
+  return { id: result.meta.last_row_id, deduplicated: false };
+}
+
+async function dispatchPendingCommands(env, limit = 50) {
+  const rows = await env.DB.prepare(
+    `SELECT c.*, d.fcm_token FROM commands c
+     JOIN devices d ON c.device_imei = d.imei
+     WHERE c.status = 'queued'
+     ORDER BY c.created_at ASC
+     LIMIT ?`
+  ).bind(limit).all();
+
+  const results = { attempted: 0, sent: 0, failed: 0, skipped_no_token: 0 };
+
+  for (const cmd of rows.results) {
+    results.attempted++;
+
+    if (!cmd.fcm_token) {
+      results.skipped_no_token++;
+      await env.DB.prepare(
+        `UPDATE commands SET attempts = attempts + 1, error_message = 'no_fcm_token' WHERE id = ?`
+      ).bind(cmd.id).run();
+      continue;
+    }
+
+    try {
+      const payload = JSON.parse(cmd.payload || '{}');
+      await sendFcm(env, cmd.fcm_token, payload);
+      await env.DB.prepare(
+        `UPDATE commands SET status = 'sent', sent_at = CURRENT_TIMESTAMP, attempts = attempts + 1, error_message = NULL WHERE id = ?`
+      ).bind(cmd.id).run();
+      await logAudit(env, 'command', cmd.id, 'sent', { imei: cmd.device_imei });
+      results.sent++;
+    } catch (err) {
+      await env.DB.prepare(
+        `UPDATE commands SET attempts = attempts + 1, error_message = ? WHERE id = ?`
+      ).bind(String(err.message || err).slice(0, 500), cmd.id).run();
+      await logAudit(env, 'command', cmd.id, 'send_failed', { error: String(err.message || err) });
+      results.failed++;
+    }
+  }
+
+  return results;
+}
+
+async function detectOverdue(env) {
+  const overdueSchedules = await env.DB.prepare(`
+    SELECT s.id, s.device_imei
+    FROM schedules s
+    WHERE s.status = 'pending'
+      AND date(s.due_date, '+' || COALESCE((
+        SELECT grace_period_days FROM payment_plans p WHERE p.id = s.plan_id
+      ), 3) || ' days') < date('now')
+  `).all();
+
+  const results = { marked_overdue: 0, devices_locked: 0, commands_queued: 0, commands_deduplicated: 0 };
+  const touchedDevices = new Set();
+
+  // 1. Mark schedules overdue and collect the affected devices
+  for (const row of overdueSchedules.results) {
+    await env.DB.prepare(`UPDATE schedules SET status = 'overdue' WHERE id = ?`)
+      .bind(row.id).run();
+    results.marked_overdue++;
+    touchedDevices.add(row.device_imei);
+  }
+
+  // 2. For each affected device, lock once and queue one LOCK command
+  for (const imei of touchedDevices) {
+    const device = await env.DB.prepare(`SELECT status FROM devices WHERE imei = ?`)
+      .bind(imei).first();
+
+    if (device && device.status !== 'locked') {
+      await env.DB.prepare(`UPDATE devices SET status = 'locked' WHERE imei = ?`)
+        .bind(imei).run();
+      results.devices_locked++;
+    }
+
+    const cmd = await queueCommand(env, imei, 'LOCK', 'overdue');
+    if (cmd.deduplicated) results.commands_deduplicated++;
+    else results.commands_queued++;
+  }
+
+  return results;
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    try {
+      // ── APK download (proxied from R2, public) ─
+      if (path === '/download/apk' || path.startsWith('/download/apk/')) {
+        if (!env.APK_BUCKET) {
+          return new Response('APK bucket not bound', { status: 500 });
+        }
+        const filename = path.split('/').pop() || 'signal-dpc-v0.2.0-alpha.apk';
+        const key = filename === 'download' || filename === 'apk'
+          ? 'signal-dpc-v0.2.0-alpha.apk'
+          : filename;
+
+        const obj = await env.APK_BUCKET.get(key);
+        if (!obj) {
+          return new Response('APK not found: ' + key, { status: 404 });
+        }
+
+        const headers = new Headers();
+        headers.set('Content-Type', 'application/vnd.android.package-archive');
+        headers.set('Content-Length', obj.size.toString());
+        headers.set('Cache-Control', 'public, max-age=3600');
+        headers.set('Content-Disposition', 'attachment; filename="' + key + '"');
+
+        return new Response(obj.body, { status: 200, headers });
+      }
+
+      if (path === '/health') {
+        return json({ status: 'ok', market: 'Uganda', time: new Date().toISOString() });
+      }
+
+      if (path === '/api/device/ack' && request.method === 'POST') {
+        const { command_id } = await request.json().catch(() => ({}));
+        if (!command_id) return json({ error: 'command_id required' }, 400);
+        await env.DB.prepare(
+          `UPDATE commands SET status = 'acknowledged', acknowledged_at = CURRENT_TIMESTAMP WHERE id = ?`
+        ).bind(command_id).run();
+        await logAudit(env, 'command', command_id, 'acknowledged', { via: 'device' });
+        return json({ success: true, command_id });
+      }
+
+
+      // ── Devices ────────────────────────────
+      if (path === '/api/devices' && request.method === 'POST') {
+        const { imei, customer_name, customer_phone, fcm_token } = await request.json();
+        const reseller = getResellerEmail(request);
+
+        // Upsert: if device already exists (from app registration), update;
+        // else insert new with reseller attribution.
+        const existing = await env.DB.prepare(`SELECT imei FROM devices WHERE imei = ?`).bind(imei).first();
+        if (existing) {
+          await env.DB.prepare(
+            `UPDATE devices SET customer_name = ?, customer_phone = ?, fcm_token = COALESCE(?, fcm_token),
+             reseller_email = COALESCE(?, reseller_email) WHERE imei = ?`
+          ).bind(customer_name, customer_phone, fcm_token || null, reseller || null, imei).run();
+        } else {
+          await env.DB.prepare(
+            `INSERT INTO devices (imei, customer_name, customer_phone, fcm_token, reseller_email)
+             VALUES (?, ?, ?, ?, ?)`
+          ).bind(imei, customer_name, customer_phone, fcm_token || null, reseller || null).run();
+        }
+        await logAudit(env, 'device', imei, 'created', { customer_name, reseller });
+        return json({ success: true, imei });
+      }
+
+      if (path === '/api/devices' && request.method === 'GET') {
+        const devices = await env.DB.prepare(
+          `SELECT * FROM devices ORDER BY created_at DESC`
+        ).all();
+        return json(devices.results);
+      }
+
+      if (path.startsWith('/api/devices/') && request.method === 'GET') {
+        const imei = path.split('/').pop();
+        const device = await env.DB.prepare(`SELECT * FROM devices WHERE imei = ?`)
+          .bind(imei).first();
+        if (!device) return json({ error: 'Not found' }, 404);
+        return json(device);
+      }
+
+      // ── Plans ──────────────────────────────
+      if (path === '/api/plans' && request.method === 'POST') {
+        const { plan_name, total_amount_ugx, installment_count, grace_period_days } = await request.json();
+        const result = await env.DB.prepare(
+          `INSERT INTO payment_plans (plan_name, total_amount_ugx, installment_count, grace_period_days) VALUES (?, ?, ?, ?)`
+        ).bind(plan_name, total_amount_ugx, installment_count, grace_period_days || 3).run();
+        await logAudit(env, 'plan', result.meta.last_row_id, 'created', { plan_name });
+        return json({ success: true, plan_id: result.meta.last_row_id });
+      }
+
+      if (path === '/api/plans' && request.method === 'GET') {
+        const plans = await env.DB.prepare(
+          `SELECT * FROM payment_plans ORDER BY created_at DESC`
+        ).all();
+        return json(plans.results);
+      }
+
+      // ── Assign plan (installments rounded to whole UGX) ──
+      if (path === '/api/assign-plan' && request.method === 'POST') {
+        const { imei, plan_id, start_date } = await request.json();
+        const plan = await env.DB.prepare(`SELECT * FROM payment_plans WHERE id = ?`)
+          .bind(plan_id).first();
+        if (!plan) return json({ error: 'Plan not found' }, 404);
+
+        const n = plan.installment_count;
+        const total = Math.round(plan.total_amount_ugx);
+        const base = Math.floor(total / n);
+        const remainder = total - base * n; // assign to last installment
+
+        const start = new Date(start_date || Date.now());
+        const statements = [];
+        for (let i = 0; i < n; i++) {
+          const amount = (i === n - 1) ? base + remainder : base;
+          const dueDate = new Date(start);
+          dueDate.setMonth(dueDate.getMonth() + i);
+          statements.push(
+            env.DB.prepare(
+              `INSERT INTO schedules (device_imei, plan_id, installment_number, due_date, amount_due_ugx)
+               VALUES (?, ?, ?, ?, ?)`
+            ).bind(imei, plan_id, i + 1, dueDate.toISOString().split('T')[0], amount)
+          );
+        }
+        await env.DB.batch(statements);
+        await logAudit(env, 'device', imei, 'plan_assigned', { plan_id, installments: n, total });
+        return json({ success: true, installments_created: n, installment_amount: base, last_installment: base + remainder });
+      }
+
+      // ── Schedules ──────────────────────────
+      if (path.startsWith('/api/schedules/') && request.method === 'GET') {
+        const imei = path.split('/').pop();
+        const schedules = await env.DB.prepare(
+          `SELECT * FROM schedules WHERE device_imei = ? ORDER BY installment_number`
+        ).bind(imei).all();
+        return json(schedules.results);
+      }
+
+      // ── Manual overdue trigger ─────────────
+      if (path === '/api/admin/run-overdue-check' && request.method === 'POST') {
+        const result = await detectOverdue(env);
+        return json({ success: true, ...result });
+      }
+
+      // ── Manual lock / unlock ───────────────
+      if (path === '/api/commands/lock' && request.method === 'POST') {
+        const { imei, reason } = await request.json();
+        if (!imei) return json({ error: 'imei required' }, 400);
+        await env.DB.prepare(`UPDATE devices SET status = 'locked' WHERE imei = ?`).bind(imei).run();
+        const cmd = await queueCommand(env, imei, 'LOCK', reason || 'manual');
+        return json({ success: true, command_id: cmd.id, deduplicated: cmd.deduplicated });
+      }
+
+      if (path === '/api/commands/unlock' && request.method === 'POST') {
+        const { imei, reason } = await request.json();
+        if (!imei) return json({ error: 'imei required' }, 400);
+        await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(imei).run();
+        const cmd = await queueCommand(env, imei, 'UNLOCK', reason || 'manual');
+        return json({ success: true, command_id: cmd.id, deduplicated: cmd.deduplicated });
+      }
+
+
+      // ── Acknowledge command (called by Android app after executing) ──
+      if (path.match(/^\/api\/commands\/\d+\/acknowledge$/) && request.method === 'POST') {
+        const id = Number(path.split('/')[3]);
+        const body = await request.json().catch(() => ({}));
+        await env.DB.prepare(
+          `UPDATE commands SET status = 'acknowledged', acknowledged_at = CURRENT_TIMESTAMP WHERE id = ?`
+        ).bind(id).run();
+        await logAudit(env, 'command', id, 'acknowledged', body || {});
+        return json({ success: true, command_id: id });
+      }
+
+      // ── Test push (send to a raw FCM token) ────────
+      if (path === '/api/admin/test-push' && request.method === 'POST') {
+        const { fcm_token, action, reason } = await request.json();
+        if (!fcm_token) return json({ error: 'fcm_token required' }, 400);
+        try {
+          const resp = await sendFcm(env, fcm_token, {
+            action: action || 'TEST',
+            reason: reason || 'manual_test',
+            ts: Date.now(),
+          });
+          return json({ success: true, fcm_response: resp });
+        } catch (err) {
+          return json({ success: false, error: String(err.message || err) }, 500);
+        }
+      }
+
+      // ── Manual dispatch flush ──────────────────────
+      if (path === '/api/admin/dispatch-queue' && request.method === 'POST') {
+        const result = await dispatchPendingCommands(env, 100);
+        return json({ success: true, ...result });
+      }
+
+
+      // ── Public: device status via query param (Access-friendly) ─
+      if (path === '/api/device-status' && (request.method === 'GET' || request.method === 'HEAD')) {
+        const imei = url.searchParams.get('imei');
+        if (!imei) return json({ error: 'imei required' }, 400);
+
+        const device = await env.DB.prepare(`SELECT imei, status FROM devices WHERE imei = ?`)
+          .bind(imei).first();
+        if (!device) return json({ error: 'Not found' }, 404);
+
+        const overdueCount = await env.DB.prepare(
+          `SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`
+        ).bind(imei).first();
+        const nextDue = await env.DB.prepare(
+          `SELECT id, due_date, amount_due_ugx, amount_paid_ugx FROM schedules
+           WHERE device_imei = ? AND status IN ('pending','overdue')
+           ORDER BY due_date ASC LIMIT 1`
+        ).bind(imei).first();
+
+        return json({
+          imei: device.imei,
+          status: device.status,
+          overdue_count: overdueCount.cnt,
+          next_due: nextDue || null,
+        });
+      }
+
+      // ── Public: device status check (no auth) ─────
+      if (path.startsWith('/api/devices/') && path.endsWith('/public-status') && request.method === 'GET') {
+        const imei = path.split('/')[3];
+        const device = await env.DB.prepare(
+          `SELECT imei, status FROM devices WHERE imei = ?`
+        ).bind(imei).first();
+        if (!device) return json({ error: 'Not found' }, 404);
+
+        const overdueCount = await env.DB.prepare(
+          `SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`
+        ).bind(imei).first();
+        const nextDue = await env.DB.prepare(
+          `SELECT id, due_date, amount_due_ugx, amount_paid_ugx FROM schedules
+           WHERE device_imei = ? AND status IN ('pending','overdue')
+           ORDER BY due_date ASC LIMIT 1`
+        ).bind(imei).first();
+
+        return json({
+          imei,
+          status: device.status,
+          overdue_count: overdueCount.cnt,
+          next_due: nextDue || null,
+        });
+      }
+
+      // ── Admin: generate provisioning QR payload for a device ──
+      if (path.match(/^\/api\/devices\/[^/]+\/qr$/) && request.method === 'GET') {
+        const imei = path.split('/')[3];
+
+        // Compose the provisioning JSON (same shape as /tmp/provisioning-*.json)
+        const apkUrlObj = await env.APK_BUCKET.get('signal-dpc-v0.2.0-alpha.apk');
+        if (!apkUrlObj) return json({ error: 'APK not found in R2' }, 500);
+
+        const checksumBytes = await crypto.subtle.digest('SHA-256', await apkUrlObj.arrayBuffer());
+        const checksumB64 = btoa(String.fromCharCode(...new Uint8Array(checksumBytes)))
+          .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+        const apkUrl = 'https://device-finance-api.whiteghostpheonix.workers.dev/download/apk/signal-dpc-v0.2.0-alpha.apk';
+        const component = 'ug.co.signalelectronics.devicefinance/.SignalDeviceAdminReceiver';
+
+        const payload = {
+          'android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME': component,
+          'android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_DOWNLOAD_LOCATION': apkUrl,
+          'android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_CHECKSUM': checksumB64,
+          'android.app.extra.PROVISIONING_LEAVE_ALL_SYSTEM_APPS_ENABLED': true,
+          'android.app.extra.PROVISIONING_SKIP_ENCRYPTION': true,
+          'android.app.extra.PROVISIONING_SKIP_USER_SETUP': true,
+          'android.app.extra.PROVISIONING_ADMIN_EXTRAS_BUNDLE': {
+            server_url: 'https://device-finance-api.whiteghostpheonix.workers.dev',
+          },
+        };
+
+        return json({ imei, payload, payload_json: JSON.stringify(payload) });
+      }
+
+      // ── Public: heartbeat (updates last_seen, keeps device online) ──
+      if (path.match(/^\/api\/devices\/[^/]+\/heartbeat$/) && request.method === 'POST') {
+        const imei = path.split('/')[3];
+        const body = await request.json().catch(() => ({}));
+        const device = await env.DB.prepare(`SELECT imei FROM devices WHERE imei = ?`)
+          .bind(imei).first();
+        if (!device) return json({ error: 'Device not registered' }, 404);
+
+        await logAudit(env, 'device', imei, 'heartbeat', body);
+
+        // Send the full schedule so the device can self-enforce offline
+        const schedules = await env.DB.prepare(
+          `SELECT s.installment_number, s.due_date, s.amount_due_ugx,
+                  s.amount_paid_ugx, s.status,
+                  (SELECT grace_period_days FROM payment_plans p WHERE p.id = s.plan_id) as grace_days
+           FROM schedules s WHERE s.device_imei = ?
+           ORDER BY s.installment_number`
+        ).bind(imei).all();
+
+        return json({
+          success: true,
+          ts: Date.now(),
+          device_status: device.status,
+          schedule: schedules.results || [],
+        });
+      }
+
+      // ── Public: FCM token update ─────────────────────
+      if (path.match(/^\/api\/devices\/[^/]+\/fcm$/) && request.method === 'PUT') {
+        const imei = path.split('/')[3];
+        const { fcm_token } = await request.json().catch(() => ({}));
+        if (!fcm_token) return json({ error: 'fcm_token required' }, 400);
+        await env.DB.prepare(`UPDATE devices SET fcm_token = ? WHERE imei = ?`)
+          .bind(fcm_token, imei).run();
+        await logAudit(env, 'device', imei, 'fcm_token_updated', {});
+        return json({ success: true });
+      }
+
+      // ── Public: latest APK info (for self-update) ──
+      if (path === '/api/apk/latest' && request.method === 'GET') {
+        // Hardcoded for now; later, make this read from D1 or KV
+        const version = '0.2.0';
+        const apkUrl = 'https://device-finance-api.whiteghostpheonix.workers.dev/download/apk/signal-dpc-v0.2.0-alpha.apk';
+        let checksum = null;
+        try {
+          const obj = await env.APK_BUCKET.get('signal-dpc-v0.2.0-alpha.apk');
+          if (obj) checksum = obj.httpEtag;
+        } catch (_) {}
+        return json({ version, apk_url: apkUrl, checksum, released: '2026-09-30' });
+      }
+
+      // ── Public: initiate payment intent ────────────
+      if (path === '/api/payments/initiate' && request.method === 'POST') {
+        const { imei, amount_ugx, method } = await request.json();
+        if (!imei || !amount_ugx) return json({ error: 'imei and amount_ugx required' }, 400);
+
+        // Create a payment intent ID; in production, this would call MTN MoMo / Airtel APIs
+        const intentId = 'PI-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+
+        await logAudit(env, 'payment_intent', intentId, 'created', { imei, amount_ugx, method });
+
+        // For now, return a placeholder payment URL. Replace with real MTN/Airtel flow.
+        const baseUrl = "https://device-finance-api.whiteghostpheonix.workers.dev";
+        const paymentUrl = baseUrl + "/pay?intent=" + intentId + "&imei=" + imei + "&amount=" + amount_ugx;
+
+        return json({
+          success: true,
+          intent_id: intentId,
+          amount_ugx,
+          payment_url: paymentUrl,
+          instructions: method === 'mtn'
+            ? 'Dial *165# to pay via MTN MoMo'
+            : method === 'airtel'
+              ? 'Dial *185# to pay via Airtel Money'
+              : 'Follow the prompt to pay',
+        });
+      }
+
+      // ── Auto: mobile money webhook (no auth for now) ──
+      // In production, verify signature from the aggregator
+      if (path === '/api/payments/auto' && request.method === 'POST') {
+        const { imei, schedule_id, amount_ugx, method, reference } = await request.json();
+        if (!imei || !amount_ugx) return json({ error: 'imei and amount_ugx required' }, 400);
+
+        // Find the schedule
+        let schedule;
+        if (schedule_id) {
+          schedule = await env.DB.prepare(`SELECT * FROM schedules WHERE id = ?`)
+            .bind(schedule_id).first();
+        } else {
+          // Auto-find the oldest pending/overdue schedule for this device
+          schedule = await env.DB.prepare(
+            `SELECT * FROM schedules WHERE device_imei = ? AND status IN ('pending','overdue')
+             ORDER BY installment_number ASC LIMIT 1`
+          ).bind(imei).first();
+        }
+        if (!schedule) return json({ error: 'No unpaid schedule found' }, 404);
+
+        // Record payment
+        const newPaid = (schedule.amount_paid_ugx || 0) + Number(amount_ugx);
+        const newStatus = newPaid >= schedule.amount_due_ugx ? 'paid' : schedule.status;
+
+        await env.DB.prepare(
+          `UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?`
+        ).bind(newPaid, newStatus, schedule.id).run();
+
+        await env.DB.prepare(
+          `INSERT INTO transactions (schedule_id, amount_ugx, payment_method, reference) VALUES (?, ?, ?, ?)`
+        ).bind(schedule.id, amount_ugx, method || 'unknown', reference || null).run();
+
+        await logAudit(env, 'schedule', schedule.id, 'payment_auto',
+          { amount_ugx, method, reference, imei });
+
+        // Auto-unlock if no overdue remain
+        const overdueLeft = await env.DB.prepare(
+          `SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`
+        ).bind(imei).first();
+
+        let unlocked = false;
+        if (overdueLeft.cnt === 0) {
+          await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(imei).run();
+          const cmd = await queueCommand(env, imei, 'UNLOCK', 'payment_auto_cleared');
+          unlocked = true;
+        }
+
+        return json({
+          success: true,
+          schedule_id: schedule.id,
+          schedule_status: newStatus,
+          device_unlocked: unlocked,
+          overdue_remaining: overdueLeft.cnt,
+        });
+      }
+
+
+      // ═══════════════════════════════════════════
+      // DASHBOARD DATA ENDPOINTS
+      // ═══════════════════════════════════════════
+
+      // Dashboard summary stats
+      if (path === '/api/dashboard/summary' && request.method === 'GET') {
+        const reseller = getResellerEmail(request);
+
+        let q, p;
+        if (reseller) {
+          q = (sql) => env.DB.prepare(sql).bind(reseller).first();
+          const totalDevices = await q(`SELECT COUNT(*) as c FROM devices WHERE reseller_email = ?`);
+          const activeDevices = await q(`SELECT COUNT(*) as c FROM devices WHERE status='active' AND reseller_email = ?`);
+          const lockedDevices = await q(`SELECT COUNT(*) as c FROM devices WHERE status='locked' AND reseller_email = ?`);
+          const overdueSchedules = await q(`SELECT COUNT(*) as c FROM schedules WHERE status='overdue' AND device_imei IN (SELECT imei FROM devices WHERE reseller_email = ?)`);
+          const totalCollected = await q(`SELECT COALESCE(SUM(t.amount_ugx),0) as s FROM transactions t JOIN schedules s ON t.schedule_id = s.id WHERE s.device_imei IN (SELECT imei FROM devices WHERE reseller_email = ?)`);
+          const pendingCommands = await q(`SELECT COUNT(*) as c FROM commands WHERE status='queued' AND device_imei IN (SELECT imei FROM devices WHERE reseller_email = ?)`);
+          return json({
+            total_devices: totalDevices.c,
+            active_devices: activeDevices.c,
+            locked_devices: lockedDevices.c,
+            overdue_schedules: overdueSchedules.c,
+            total_collected_ugx: totalCollected.s,
+            pending_commands: pendingCommands.c,
+          });
+        } else {
+          const totalDevices = await env.DB.prepare(`SELECT COUNT(*) as c FROM devices`).first();
+          const activeDevices = await env.DB.prepare(`SELECT COUNT(*) as c FROM devices WHERE status='active'`).first();
+          const lockedDevices = await env.DB.prepare(`SELECT COUNT(*) as c FROM devices WHERE status='locked'`).first();
+          const overdueSchedules = await env.DB.prepare(`SELECT COUNT(*) as c FROM schedules WHERE status='overdue'`).first();
+          const totalCollected = await env.DB.prepare(`SELECT COALESCE(SUM(amount_ugx),0) as s FROM transactions`).first();
+          const pendingCommands = await env.DB.prepare(`SELECT COUNT(*) as c FROM commands WHERE status='queued'`).first();
+          return json({
+            total_devices: totalDevices.c,
+            active_devices: activeDevices.c,
+            locked_devices: lockedDevices.c,
+            overdue_schedules: overdueSchedules.c,
+            total_collected_ugx: totalCollected.s,
+            pending_commands: pendingCommands.c,
+          });
+        }
+      }
+
+      // Devices with plan + next due
+      if (path === '/api/dashboard/devices' && request.method === 'GET') {
+        const reseller = getResellerEmail(request);
+        const query = reseller
+          ? `SELECT d.imei, d.customer_name, d.customer_phone, d.status, d.created_at, d.reseller_email,
+              (SELECT COUNT(*) FROM schedules s WHERE s.device_imei = d.imei AND s.status = 'paid') as paid_count,
+              (SELECT COUNT(*) FROM schedules s WHERE s.device_imei = d.imei) as total_count,
+              (SELECT SUM(s.amount_due_ugx - COALESCE(s.amount_paid_ugx,0)) FROM schedules s WHERE s.device_imei = d.imei AND s.status != 'paid') as balance_ugx,
+              (SELECT s.due_date FROM schedules s WHERE s.device_imei = d.imei AND s.status IN ('pending','overdue') ORDER BY s.due_date ASC LIMIT 1) as next_due_date
+             FROM devices d
+             WHERE d.reseller_email = ?
+             ORDER BY d.created_at DESC LIMIT 500`
+          : `SELECT d.imei, d.customer_name, d.customer_phone, d.status, d.created_at, d.reseller_email,
+              (SELECT COUNT(*) FROM schedules s WHERE s.device_imei = d.imei AND s.status = 'paid') as paid_count,
+              (SELECT COUNT(*) FROM schedules s WHERE s.device_imei = d.imei) as total_count,
+              (SELECT SUM(s.amount_due_ugx - COALESCE(s.amount_paid_ugx,0)) FROM schedules s WHERE s.device_imei = d.imei AND s.status != 'paid') as balance_ugx,
+              (SELECT s.due_date FROM schedules s WHERE s.device_imei = d.imei AND s.status IN ('pending','overdue') ORDER BY s.due_date ASC LIMIT 1) as next_due_date
+             FROM devices d
+             ORDER BY d.created_at DESC LIMIT 500`;
+
+        const rows = reseller
+          ? await env.DB.prepare(query).bind(reseller).all()
+          : await env.DB.prepare(query).all();
+        return json(rows.results);
+      }
+
+      // Device detail (with schedules + transactions)
+      if (path.startsWith('/api/dashboard/devices/') && request.method === 'GET') {
+        const imei = path.split('/').pop();
+        const device = await env.DB.prepare(`SELECT * FROM devices WHERE imei = ?`).bind(imei).first();
+        if (!device) return json({ error: 'Not found' }, 404);
+        const schedules = await env.DB.prepare(
+          `SELECT * FROM schedules WHERE device_imei = ? ORDER BY installment_number`
+        ).bind(imei).all();
+        const transactions = await env.DB.prepare(
+          `SELECT t.* FROM transactions t
+           JOIN schedules s ON t.schedule_id = s.id
+           WHERE s.device_imei = ?
+           ORDER BY t.paid_at DESC LIMIT 50`
+        ).bind(imei).all();
+        const commands = await env.DB.prepare(
+          `SELECT * FROM commands WHERE device_imei = ? ORDER BY created_at DESC LIMIT 20`
+        ).bind(imei).all();
+        return json({
+          device,
+          schedules: schedules.results,
+          transactions: transactions.results,
+          commands: commands.results,
+        });
+      }
+
+      // ═══════════════════════════════════════════
+      // PAYMENT PAGE (customer-facing)
+      // ═══════════════════════════════════════════
+      if (path === '/pay' && (request.method === 'GET' || request.method === 'HEAD')) {
+        const imei = url.searchParams.get('imei') || '';
+        const amount = url.searchParams.get('amount') || '0';
+        const intentId = url.searchParams.get('intent') || '';
+
+        const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Signal Electronics — Payment</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0F62FE;
+    color: #fff;
+    margin: 0;
+    padding: 24px;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .card {
+    background: #fff;
+    color: #1a1a1a;
+    border-radius: 16px;
+    padding: 32px 24px;
+    max-width: 400px;
+    width: 100%;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+  }
+  h1 { margin: 0 0 8px; font-size: 22px; color: #0F62FE; }
+  .sub { color: #666; font-size: 14px; margin-bottom: 24px; }
+  .amount { font-size: 40px; font-weight: bold; margin: 24px 0; color: #0F62FE; text-align: center; }
+  .label { font-size: 12px; text-transform: uppercase; color: #999; letter-spacing: 1px; }
+  .value { font-size: 15px; margin-bottom: 16px; word-break: break-all; }
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 16px;
+    margin: 12px 0;
+    border: none;
+    border-radius: 12px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: none;
+    text-align: center;
+  }
+  .btn-mtn { background: #FFCC00; color: #000; }
+  .btn-airtel { background: #ED1C24; color: #fff; }
+  .btn-alt { background: #f0f0f0; color: #333; }
+  .note { font-size: 12px; color: #999; margin-top: 16px; text-align: center; }
+  .status { text-align: center; padding: 12px; border-radius: 8px; margin: 16px 0; font-weight: 600; }
+  .success { background: #d4edda; color: #155724; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Pay Installment</h1>
+    <div class="sub">Signal Electronics device financing</div>
+
+    <div class="label">Device</div>
+    <div class="value">${imei || 'Unknown'}</div>
+
+    <div class="label">Amount Due</div>
+    <div class="amount">UGX ${Number(amount).toLocaleString()}</div>
+
+    <p style="text-align:center;color:#666;font-size:14px;">Choose payment method:</p>
+
+    <a class="btn btn-mtn" href="tel:*165%23" onclick="markPending()">📱 Pay with MTN MoMo (*165#)</a>
+    <a class="btn btn-airtel" href="tel:*185%23" onclick="markPending()">📱 Pay with Airtel Money (*185#)</a>
+    <a class="btn btn-alt" href="tel:+256706352822" onclick="markPending()">💬 Call Support</a>
+
+    <div id="statusBox"></div>
+
+    <p class="note">After payment, this device will unlock automatically within 30 seconds.</p>
+  </div>
+
+<script>
+  const imei = ${JSON.stringify(imei)};
+  const intentId = ${JSON.stringify(intentId)};
+  const amount = ${Number(amount) || 0};
+
+  function markPending() {
+    document.getElementById('statusBox').innerHTML =
+      '<div class="status" style="background:#fff3cd;color:#856404;">Waiting for payment confirmation…</div>';
+    pollStatus();
+  }
+
+  function pollStatus() {
+    let attempts = 0;
+    const interval = setInterval(async () => {
+      attempts++;
+      try {
+        const r = await fetch('/api/device-status?imei=' + encodeURIComponent(imei));
+        const data = await r.json();
+        if (data.status === 'active' && data.overdue_count === 0) {
+          document.getElementById('statusBox').innerHTML =
+            '<div class="status success">✅ Payment received. Device unlocked.</div>';
+          clearInterval(interval);
+          setTimeout(() => { window.location.href = 'payment-success'; }, 2000);
+        }
+      } catch (e) {}
+      if (attempts > 40) clearInterval(interval);
+    }, 3000);
+  }
+</script>
+</body>
+</html>`;
+        return new Response(html, {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        });
+      }
+
+      if ((path === '/pay/payment-success' || path === '/payment-success') && (request.method === 'GET' || request.method === 'HEAD')) {
+        const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Payment Successful</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #0F62FE; color: #fff;
+         margin: 0; min-height: 100vh; display: flex; align-items: center;
+         justify-content: center; padding: 24px; }
+  .box { background: #fff; color: #1a1a1a; padding: 40px 24px; border-radius: 16px;
+         text-align: center; max-width: 400px; }
+  .check { font-size: 72px; margin-bottom: 16px; }
+  h1 { color: #0F62FE; font-size: 24px; margin: 0 0 8px; }
+  p { color: #666; margin: 8px 0; }
+</style></head><body>
+<div class="box">
+  <div class="check">✅</div>
+  <h1>Payment Received</h1>
+  <p>Your device will unlock momentarily.</p>
+  <p style="font-size:12px;margin-top:24px;">Signal Electronics • +256 706 352 822</p>
+</div>
+</body></html>`;
+        return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      }
+
+      // ── Command queue ──────────────────────
+      if (path === '/api/commands' && request.method === 'GET') {
+        const status = url.searchParams.get('status');
+        const q = status
+          ? env.DB.prepare(`SELECT * FROM commands WHERE status = ? ORDER BY created_at DESC LIMIT 100`).bind(status)
+          : env.DB.prepare(`SELECT * FROM commands ORDER BY created_at DESC LIMIT 100`);
+        const commands = await q.all();
+        return json(commands.results);
+      }
+
+      // ── Record payment ─────────────────────
+      if (path === '/api/payments' && request.method === 'POST') {
+        const { schedule_id, amount_ugx, payment_method, reference } = await request.json();
+        if (!schedule_id || !amount_ugx) return json({ error: 'schedule_id and amount_ugx required' }, 400);
+
+        const schedule = await env.DB.prepare(`SELECT * FROM schedules WHERE id = ?`)
+          .bind(schedule_id).first();
+        if (!schedule) return json({ error: 'Schedule not found' }, 404);
+
+        const newPaid = (schedule.amount_paid_ugx || 0) + Number(amount_ugx);
+        const newStatus = newPaid >= schedule.amount_due_ugx ? 'paid' : schedule.status;
+
+        await env.DB.prepare(
+          `UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?`
+        ).bind(newPaid, newStatus, schedule_id).run();
+
+        await env.DB.prepare(
+          `INSERT INTO transactions (schedule_id, amount_ugx, payment_method, reference) VALUES (?, ?, ?, ?)`
+        ).bind(schedule_id, amount_ugx, payment_method || 'unknown', reference || null).run();
+
+        await logAudit(env, 'schedule', schedule_id, 'payment_recorded',
+          { amount_ugx, payment_method, reference });
+
+        // Option B: unlock when no overdue schedules remain.
+        // Future 'pending' installments do NOT block the unlock.
+        const overdueLeft = await env.DB.prepare(
+          `SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`
+        ).bind(schedule.device_imei).first();
+
+        let unlocked = false;
+        if (overdueLeft.cnt === 0) {
+          await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`)
+            .bind(schedule.device_imei).run();
+          await queueCommand(env, schedule.device_imei, 'UNLOCK', 'overdue_cleared');
+          unlocked = true;
+        }
+
+        return json({
+          success: true,
+          schedule_status: newStatus,
+          device_unlocked: unlocked,
+          overdue_remaining: overdueLeft.cnt,
+        });
+      }
+
+      // ── Audit ──────────────────────────────
+      if (path === '/api/audit' && request.method === 'GET') {
+        const limit = Number(url.searchParams.get('limit') || 100);
+        const rows = await env.DB.prepare(
+          `SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?`
+        ).bind(limit).all();
+        return json(rows.results);
+      }
+
+      return json({ error: 'Not found', path }, 404);
+    } catch (error) {
+      return json({ error: error.message }, 500);
+    }
+  },
+
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil((async () => {
+      const result = await detectOverdue(env);
+      await logAudit(env, 'system', 'cron', 'overdue_check', result);
+      console.log('Cron overdue check:', JSON.stringify(result));
+    })());
+  },
+};

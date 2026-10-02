@@ -9,3 +9,11 @@ database_id = "de160f9b-e8ed-481d-b08b-a792c4ca5959"
 
 [triggers]
 crons = ["0 6 * * *"]
+
+[[r2_buckets]]
+binding = "APK_BUCKET"
+bucket_name = "signal-dpc-apk"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "signal-dpc-media"
