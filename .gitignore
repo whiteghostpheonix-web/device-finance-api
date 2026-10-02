@@ -3,3 +3,8 @@ node_modules/
 .dev.vars
 .env
 dist/
+src/*.bak
+src/*.backup
+src/*.broken*
+src/*.pre_prod
+schema_*.sql
