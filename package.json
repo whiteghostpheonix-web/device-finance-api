@@ -9,5 +9,11 @@
   "devDependencies": {
     "wrangler": "^4.0.0"
   },
-  "trustedDependencies": ["esbuild", "workerd"]
+  "trustedDependencies": [
+    "esbuild",
+    "workerd"
+  ],
+  "dependencies": {
+    "rohopay-sdk": "^1.1.3"
+  }
 }

@@ -1,3 +1,5 @@
+import { getAccessToken, registerIpn, listIpns, submitOrder, getTransactionStatus } from './pesapal.js';
+import { collectPayment, verifyRohoWebhook } from './rohopay.js';
 import { sendFcm } from './fcm.js';
 
 const corsHeaders = {
@@ -46,6 +48,54 @@ async function logAudit(env, entity, entity_id, action, details) {
     ).bind(entity, String(entity_id), action,
       typeof details === 'string' ? details : JSON.stringify(details)).run();
   } catch (_) {}
+}
+
+// Generate a short payment code for a device (6 chars: SG + 4 alphanumeric)
+function generatePaymentCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = 'SG';
+  for (let i = 0; i < 4; i++) {
+    code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return code;
+}
+
+// Find a device by payment code, IMEI, or phone number
+async function findDeviceForPayment(env, { code, phone, amount }) {
+  // Try payment code first
+  if (code) {
+    const byCode = await env.DB.prepare(
+      `SELECT imei, customer_phone FROM devices WHERE payment_code = ?`
+    ).bind(code.toUpperCase()).first();
+    if (byCode) return { device: byCode, method: 'code' };
+  }
+
+  // Try phone number (last 9 digits to be flexible)
+  if (phone) {
+    const digits = phone.replace(/\D/g, '');
+    const last9 = digits.slice(-9);
+    if (last9.length >= 9) {
+      const byPhone = await env.DB.prepare(
+        `SELECT imei, customer_phone FROM devices WHERE REPLACE(REPLACE(customer_phone, '+', ''), ' ', '') LIKE ?`
+      ).bind('%' + last9).first();
+      if (byPhone) return { device: byPhone, method: 'phone' };
+    }
+  }
+
+  // Try to find by amount + most recent unpaid schedule
+  if (amount) {
+    // Find a device with an overdue schedule close to this amount
+    const byAmount = await env.DB.prepare(
+      `SELECT s.device_imei as imei, d.customer_phone FROM schedules s
+       JOIN devices d ON s.device_imei = d.imei
+       WHERE s.status IN ('pending','overdue')
+         AND ABS(s.amount_due_ugx - COALESCE(s.amount_paid_ugx, 0) - ?) < 100
+       ORDER BY s.due_date ASC LIMIT 1`
+    ).bind(amount).first();
+    if (byAmount) return { device: byAmount, method: 'amount' };
+  }
+
+  return { device: null, method: null };
 }
 
 async function queueCommand(env, imei, command, reason) {
@@ -123,6 +173,124 @@ async function detectOverdue(env) {
   return results;
 }
 
+// ═════════════════════════════════════════════
+// Payment processing (shared by webhook + sandbox)
+// ═════════════════════════════════════════════
+async function processIncomingPayment(env, {
+  provider, provider_tx_id, amount_ugx, currency, phone,
+  reference, payment_code, fee_amount, raw_payload,
+}) {
+  // 1. Check idempotency
+  if (provider_tx_id) {
+    const existing = await env.DB.prepare(
+      `SELECT id FROM webhook_events WHERE provider = ? AND event_id = ?`
+    ).bind(provider, provider_tx_id).first();
+    if (existing) {
+      return { success: true, duplicate: true, message: 'Already processed' };
+    }
+  }
+
+  // 2. Record the webhook event
+  const eventResult = await env.DB.prepare(
+    `INSERT INTO webhook_events (provider, event_id, event_type, payload) VALUES (?, ?, ?, ?)`
+  ).bind(provider, provider_tx_id || 'unknown_' + Date.now(), 'charge.completed', JSON.stringify(raw_payload)).run();
+  const webhookEventId = eventResult.meta.last_row_id;
+
+  // 3. Match to a device
+  const { device, method } = await findDeviceForPayment(env, {
+    code: payment_code || reference,
+    phone,
+    amount: amount_ugx,
+  });
+
+  if (!device) {
+    await logAudit(env, 'payment', webhookEventId, 'unmatched', { provider, amount_ugx, phone, reference });
+    return { success: false, message: 'No matching device found', webhook_event_id: webhookEventId };
+  }
+
+  const imei = device.imei;
+
+  // 4. Get ALL unpaid schedules (to support multi-installment payments)
+  const unpaid = await env.DB.prepare(
+    `SELECT * FROM schedules WHERE device_imei = ? AND status IN ('pending','overdue')
+     ORDER BY installment_number ASC`
+  ).bind(imei).all();
+
+  if (!unpaid.results?.length) {
+    await logAudit(env, 'payment', webhookEventId, 'no_schedule', { imei, amount_ugx });
+    return { success: false, message: 'Device has no unpaid schedule', imei };
+  }
+
+  // 5. Apply the payment across schedules (oldest first)
+  let remaining = Number(amount_ugx);
+  const paidSchedules = [];
+  let firstScheduleId = null;
+
+  for (const s of unpaid.results) {
+    if (remaining <= 0) break;
+    const owed = s.amount_due_ugx - (s.amount_paid_ugx || 0);
+    const applied = Math.min(remaining, owed);
+    const newPaid = (s.amount_paid_ugx || 0) + applied;
+    const newStatus = newPaid >= s.amount_due_ugx ? 'paid' : s.status;
+
+    await env.DB.prepare(
+      `UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?`
+    ).bind(newPaid, newStatus, s.id).run();
+
+    if (newStatus === 'paid') paidSchedules.push(s.id);
+    if (!firstScheduleId) firstScheduleId = s.id;
+
+    remaining -= applied;
+  }
+
+  // 6. Record a single transaction for the whole payment (attached to first schedule)
+  const txResult = await env.DB.prepare(
+    `INSERT INTO transactions (schedule_id, amount_ugx, payment_method, reference, provider, provider_tx_id, provider_payload, fee_amount, net_amount)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    firstScheduleId, amount_ugx, provider, reference || provider_tx_id,
+    provider, provider_tx_id, JSON.stringify(raw_payload),
+    fee_amount || 0, Number(amount_ugx) - (fee_amount || 0)
+  ).run();
+
+  // 7. Record the match
+  await env.DB.prepare(
+    `INSERT INTO payment_matches (webhook_event_id, device_imei, schedule_id, match_method, amount_ugx, status)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(webhookEventId, imei, firstScheduleId, method, amount_ugx, 'paid').run();
+
+  await logAudit(env, 'payment', txResult.meta.last_row_id, 'recorded', {
+    imei, amount_ugx, provider, provider_tx_id, schedule_ids_paid: paidSchedules, method,
+    schedules_cleared: paidSchedules.length,
+  });
+
+  const newStatus = paidSchedules.length > 0 ? 'paid' : 'pending';
+
+  // 8. Check if overdue is cleared → unlock
+  const overdueLeft = await env.DB.prepare(
+    `SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`
+  ).bind(imei).first();
+
+  let unlocked = false;
+  if (overdueLeft.cnt === 0) {
+    await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(imei).run();
+    await queueCommand(env, imei, 'UNLOCK', 'payment_received');
+    unlocked = true;
+    await logAudit(env, 'device', imei, 'auto_unlocked', { reason: 'payment_cleared', tx_id: txResult.meta.last_row_id });
+  }
+
+  return {
+    success: true,
+    imei,
+    schedule_id: firstScheduleId,
+    schedule_status: newStatus,
+    device_unlocked: unlocked,
+    overdue_remaining: overdueLeft.cnt,
+    match_method: method,
+    transaction_id: txResult.meta.last_row_id,
+  };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -130,508 +298,567 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
     try {
+      // ── Health ────────────────────────────────
       if (path === '/health') return json({ status: 'ok', market: 'Uganda', time: new Date().toISOString() });
 
-      if (path.startsWith('/media/') && (request.method === 'GET' || request.method === 'HEAD')) {
-        if (!env.MEDIA_BUCKET) return new Response('Media bucket not bound', { status: 500 });
-        const key = path.slice('/media/'.length);
-        const obj = await env.MEDIA_BUCKET.get(key);
-        if (!obj) return new Response('Not found', { status: 404 });
-        const headers = new Headers();
-        headers.set('Content-Type', obj.httpMetadata?.contentType || 'application/octet-stream');
-        headers.set('Cache-Control', 'public, max-age=86400');
-        return new Response(obj.body, { status: 200, headers });
-      }
-
-      if (path === '/download/apk' || path.startsWith('/download/apk/')) {
-        if (!env.APK_BUCKET) return new Response('APK bucket not bound', { status: 500 });
-        const filename = path.split('/').pop() || 'signal-dpc-v0.2.1-alpha.apk';
-        const key = (filename === 'download' || filename === 'apk') ? 'signal-dpc-v0.2.1-alpha.apk' : filename;
-        const obj = await env.APK_BUCKET.get(key);
-        if (!obj) return new Response('APK not found: ' + key, { status: 404 });
-        const headers = new Headers();
-        headers.set('Content-Type', 'application/vnd.android.package-archive');
-        headers.set('Content-Length', obj.size.toString());
-        headers.set('Cache-Control', 'public, max-age=3600');
-        headers.set('Content-Disposition', 'attachment; filename="' + key + '"');
-        return new Response(obj.body, { status: 200, headers });
-      }
-
+      // ── Customer payment page ────────────────────
+      // ── Customer payment: redirect to Pesapal ──
+      // Usage: /pay?imei=XXX  OR  /pay?code=SGXXXX
+      //   → creates a Pesapal order for the next unpaid installment
       if (path === '/pay' && (request.method === 'GET' || request.method === 'HEAD')) {
         const imei = url.searchParams.get('imei') || '';
-        const amount = url.searchParams.get('amount') || '0';
-        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Signal Electronics — Payment</title>
-<style>* { box-sizing: border-box; } body { font-family: -apple-system, sans-serif; background: #0F62FE; color: #fff; margin: 0; padding: 24px; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-.card { background: #fff; color: #1a1a1a; border-radius: 16px; padding: 32px 24px; max-width: 400px; width: 100%; }
-h1 { margin: 0 0 8px; font-size: 22px; color: #0F62FE; } .amount { font-size: 40px; font-weight: bold; margin: 24px 0; color: #0F62FE; text-align: center; }
-.btn { display: block; width: 100%; padding: 16px; margin: 12px 0; border: none; border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer; text-decoration: none; text-align: center; }
-.btn-mtn { background: #FFCC00; color: #000; } .btn-airtel { background: #ED1C24; color: #fff; } .btn-alt { background: #f0f0f0; color: #333; }</style>
-</head><body><div class="card"><h1>Pay Installment</h1><div style="color:#666;font-size:14px;">Signal Electronics</div>
-<div style="font-size:12px;color:#999;margin-top:16px;">Device: ${imei}</div>
-<div class="amount">UGX ${Number(amount).toLocaleString()}</div>
-<a class="btn btn-mtn" href="tel:*165%23">📱 Pay with MTN MoMo (*165#)</a>
-<a class="btn btn-airtel" href="tel:*185%23">📱 Pay with Airtel Money (*185#)</a>
-<a class="btn btn-alt" href="tel:+256706352822">💬 Call Support</a></div></body></html>`;
+        const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Signal Electronics — Pay</title>
+<style>
+/* UNIQUE UI: Soft floating glass, deep dark theme, no magnified backgrounds */
+* { box-sizing: border-box; }
+body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 0; color: #fff; min-height: 100vh; background-color: #060b14; transition: background-image 1.5s ease-in-out; background-size: auto, cover; background-position: center; background-attachment: fixed; background-repeat: no-repeat; }
+.overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: radial-gradient(circle at top, rgba(6, 11, 20, 0.4), rgba(6, 11, 20, 0.95)); z-index: -1; }
+.header { text-align: center; padding: 40px 20px 20px; }
+.header h1 { margin: 0 0 6px; font-size: 22px; font-weight: 800; letter-spacing: 0.5px; color: #fff; }
+.header p { margin: 0; font-size: 12px; color: #94a3b8; letter-spacing: 1px; text-transform: uppercase; font-weight: 600; }
+.container { max-width: 420px; margin: 0 auto; padding: 0 16px 40px; }
+
+/* Floating Glass Cards */
+.glass-card { background: rgba(255, 255, 255, 0.03); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 28px; padding: 24px; box-shadow: 0 20px 40px rgba(0,0,0,0.4); margin-bottom: 20px; position: relative; overflow: hidden; }
+.glass-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent); }
+
+.label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1.5px; margin-bottom: 12px; font-weight: 700; }
+.balance { font-size: 42px; font-weight: 800; color: #fff; margin: 0; letter-spacing: -1px; }
+
+.deposit-box { background: rgba(59, 130, 246, 0.1); border: 1px solid rgba(59, 130, 246, 0.3); padding: 16px; border-radius: 16px; margin-top: 16px; display: flex; justify-content: space-between; align-items: center; }
+.deposit-box .label { color: #60a5fa; margin-bottom: 0; }
+.deposit-box .val { font-size: 18px; font-weight: 700; color: #60a5fa; }
+
+.progress-wrap { font-size: 13px; color: #cbd5e1; line-height: 1.6; margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.05); }
+
+.mode-btn { display: block; width: 100%; padding: 18px; margin-bottom: 12px; border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 18px; background: rgba(255, 255, 255, 0.02); text-align: left; cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); color: #fff; position: relative; }
+.mode-btn.selected { border-color: #3b82f6; background: rgba(59, 130, 246, 0.1); box-shadow: 0 0 20px rgba(59, 130, 246, 0.15); }
+.mode-btn strong { display: block; font-size: 15px; margin-bottom: 6px; color: #fff; font-weight: 700; }
+.mode-btn span { font-size: 13px; color: #94a3b8; }
+
+.input-group { margin-top: 16px; display: none; }
+.input-group.active { display: block; animation: fadeIn 0.3s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: translateY(0); } }
+.input-field { width: 100%; padding: 18px; border: 2px solid rgba(255,255,255,0.08); border-radius: 16px; background: rgba(0,0,0,0.3); color: #fff; font-size: 20px; font-weight: 700; text-align: center; font-family: inherit; outline: none; transition: border 0.2s; }
+.input-field:focus { border-color: #3b82f6; background: rgba(59, 130, 246, 0.05); }
+.hint { font-size: 12px; color: #60a5fa; text-align: center; margin-top: 10px; font-weight: 500;}
+
+.pay-btn { display: block; width: 100%; padding: 20px; border: none; border-radius: 18px; background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff; font-size: 17px; font-weight: 800; cursor: pointer; margin-top: 10px; transition: transform 0.1s, opacity 0.2s; box-shadow: 0 10px 20px rgba(37, 99, 235, 0.3); }
+.pay-btn:active { transform: scale(0.97); }
+.pay-btn:disabled { opacity: 0.7; cursor: not-allowed; }
+
+/* ELEGANT HELP CONTACT */
+.help-card { text-align: center; padding: 24px; background: transparent; border: 1px dashed rgba(255,255,255,0.15); }
+.help-title { font-size: 13px; color: #94a3b8; margin-bottom: 12px; }
+.help-phone { display: inline-flex; align-items: center; justify-content: center; gap: 10px; background: rgba(255,255,255,0.05); padding: 14px 24px; border-radius: 50px; color: #fff; text-decoration: none; font-weight: 700; font-size: 16px; border: 1px solid rgba(255,255,255,0.1); transition: all 0.2s; }
+.help-phone:active { background: rgba(59, 130, 246, 0.2); border-color: #3b82f6; }
+.help-icon { font-size: 18px; }
+
+.loader { display: inline-block; width: 18px; height: 18px; border: 3px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 10px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="overlay"></div>
+<div class="header">
+  <h1>Signal Electronics</h1>
+  <p>Device Financing</p>
+</div>
+<div class="container">
+  
+  <div class="glass-card">
+    <div class="label">Outstanding Balance</div>
+    <div class="balance" id="balance">Loading…</div>
+    
+    <div id="deposit-section" style="display:none;">
+      <div class="deposit-box">
+        <div class="label">Initial Deposit Required</div>
+        <div class="val" id="deposit-val">—</div>
+      </div>
+    </div>
+
+    <div class="progress-wrap" id="progress-wrap" style="display: none;"></div>
+  </div>
+
+  <div class="glass-card" id="pay-options" style="display: none;">
+    <div class="label">Select Payment Type</div>
+
+    <button class="mode-btn selected" onclick="selectMode('single', this)">
+      <strong id="single-title">Pay Next Installment</strong>
+      <span id="single-desc">—</span>
+    </button>
+
+    <button class="mode-btn" onclick="selectMode('custom', this)">
+      <strong>Pay Custom Amount</strong>
+      <span>Enter any amount above 500 UGX.</span>
+    </button>
+
+    <button class="mode-btn" onclick="selectMode('full', this)">
+      <strong>Clear Full Balance</strong>
+      <span id="full-desc">—</span>
+    </button>
+
+    <div class="input-group" id="custom-group">
+      <input type="number" id="custom-amount" class="input-field" min="500" step="100" oninput="updateSummary()" placeholder="Amount in UGX">
+      <div class="hint" id="coverage-hint"></div>
+    </div>
+
+    <div class="input-group active" id="phone-group" style="margin-top: 24px; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 24px;">
+      <div class="label" style="color: #fff;">Mobile Money Number</div>
+      <input type="tel" id="phone-number" class="input-field" placeholder="07XX XXX XXX" style="text-align: left; font-size: 18px; letter-spacing: 2px;">
+      <div class="hint" style="text-align: left; color: #94a3b8; margin-top: 8px;">STK Push will be sent here.</div>
+    </div>
+
+    <button class="pay-btn" id="pay-btn" onclick="startPayment()" style="margin-top: 24px;">Pay Now</button>
+  </div>
+
+  <!-- NEW ELEGANT HELP SECTION -->
+  <div class="glass-card help-card">
+    <div class="help-title">Need assistance with your payment?</div>
+    <a href="tel:+256706352822" class="help-phone">
+      <span class="help-icon">📞</span> +256 706 352 822
+    </a>
+  </div>
+
+</div>
+
+<script>
+const IMEI = ${JSON.stringify(imei)};
+let currentMode = 'single';
+let schedules = [];
+
+// Background gallery: NATURAL SIZE, NO MAGNIFICATION
+const IMAGES = [
+  'https://device-finance-api.whiteghostpheonix.workers.dev/media/static/bg1.png',
+  'https://device-finance-api.whiteghostpheonix.workers.dev/media/static/bg2.jpg',
+  'https://device-finance-api.whiteghostpheonix.workers.dev/media/static/bg3.jpg',
+  'https://device-finance-api.whiteghostpheonix.workers.dev/media/static/bg4.jpg',
+  'https://device-finance-api.whiteghostpheonix.workers.dev/media/static/bg5.jpg',
+  'https://device-finance-api.whiteghostpheonix.workers.dev/media/static/bg6.jpg',
+  'https://device-finance-api.whiteghostpheonix.workers.dev/media/static/bg7.jpg'
+];
+let idx = 0;
+function rotateBg() {
+  // Set background-size to 'auto' so it doesn't magnify, keeping the original image size
+  document.body.style.backgroundImage = "url('" + IMAGES[idx % IMAGES.length] + "')";
+  idx++;
+}
+if (IMAGES.length > 0) {
+  IMAGES.forEach(src => { const i = new Image(); i.src = src; });
+  rotateBg();
+  setInterval(rotateBg, 8000);
+}
+
+function formatUGX(n) { return Math.round(n).toLocaleString(); }
+
+async function loadSchedules() {
+  try {
+    const r = await fetch('/public/schedule?imei=' + encodeURIComponent(IMEI));
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+    schedules = data.schedule || [];
+    render();
+  } catch (e) {
+    document.getElementById('balance').innerText = 'Error loading data';
+    document.getElementById('balance').style.color = '#ef4444';
+  }
+}
+
+function render() {
+  const unpaid = schedules.filter(s => s.status !== 'paid');
+  const paid = schedules.filter(s => s.status === 'paid');
+  const totalOwed = unpaid.reduce((sum, s) => sum + (s.amount_due_ugx - (s.amount_paid_ugx || 0)), 0);
+
+  document.getElementById('balance').innerText = 'UGX ' + formatUGX(totalOwed);
+
+  if (unpaid.length === 0) {
+    document.getElementById('balance').innerText = 'Fully Paid';
+    document.getElementById('balance').style.color = '#10b981';
+    document.getElementById('pay-options').style.display = 'none';
+    return;
+  }
+
+  const first = schedules[0];
+  const isFirstUnpaid = first && first.status !== 'paid';
+  
+  if (isFirstUnpaid) {
+    document.getElementById('deposit-section').style.display = 'block';
+    const depOwed = first.amount_due_ugx - (first.amount_paid_ugx || 0);
+    document.getElementById('deposit-val').innerText = 'UGX ' + formatUGX(depOwed);
+    document.getElementById('single-title').innerText = 'Pay Initial Deposit';
+    document.getElementById('single-desc').innerText = 'UGX ' + formatUGX(depOwed);
+  } else {
+    document.getElementById('deposit-section').style.display = 'none';
+    document.getElementById('single-title').innerText = 'Pay Next Installment';
+    document.getElementById('single-desc').innerText = 'UGX ' + formatUGX(unpaid[0].amount_due_ugx - (unpaid[0].amount_paid_ugx || 0));
+  }
+
+  const per = schedules[1]?.amount_due_ugx || 0;
+  const progressWrap = document.getElementById('progress-wrap');
+  progressWrap.style.display = 'block';
+  
+  if (isFirstUnpaid) {
+    progressWrap.innerHTML = 'Once deposit is cleared, you will pay <strong>UGX ' + formatUGX(per) + '</strong> per installment.';
+  } else {
+    progressWrap.innerHTML = '<strong>' + paid.length + '</strong> of <strong>' + schedules.length + '</strong> payments cleared.<br>Recurring rate: <strong>UGX ' + formatUGX(per) + '</strong>.';
+  }
+
+  document.getElementById('full-desc').innerText = 'UGX ' + formatUGX(totalOwed) + ' (all remaining)';
+  document.getElementById('pay-options').style.display = 'block';
+  updateSummary();
+}
+
+function selectMode(mode, el) {
+  currentMode = mode;
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('selected'));
+  el.classList.add('selected');
+  document.getElementById('custom-group').classList.toggle('active', mode === 'custom');
+  updateSummary();
+}
+
+function computeAmount() {
+  const unpaid = schedules.filter(s => s.status !== 'paid');
+  if (currentMode === 'single') return Math.round(unpaid[0].amount_due_ugx - (unpaid[0].amount_paid_ugx || 0));
+  if (currentMode === 'custom') return Math.round(Number(document.getElementById('custom-amount').value) || 0);
+  return Math.round(unpaid.reduce((sum, s) => sum + (s.amount_due_ugx - (s.amount_paid_ugx || 0)), 0));
+}
+
+function updateSummary() {
+  if (currentMode === 'custom') {
+    const amount = computeAmount();
+    document.getElementById('coverage-hint').innerText = amount < 500 ? 'Minimum is 500 UGX' : 'You are paying UGX ' + formatUGX(amount);
+  }
+}
+
+async function startPayment() {
+  const amount = computeAmount();
+  const phone = document.getElementById('phone-number').value.trim();
+  
+  if (amount < 500) { alert('Minimum payment is 500 UGX.'); return; }
+  if (!phone || phone.length < 9) { alert('Please enter a valid phone number.'); return; }
+
+  const btn = document.getElementById('pay-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loader"></span> Connecting…';
+
+  const body = { device_imei: IMEI, mode: currentMode, custom_amount_ugx: amount, phone: phone };
+
+  try {
+    const r = await fetch('/public/create-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    
+    if (data.error) throw new Error(data.error);
+    
+    // REDIRECT TO NEW PROCESSING PAGE
+    window.location.href = '/processing?amount=' + amount + '&phone=' + encodeURIComponent(phone) + '&ref=' + data.reference + '&imei=' + IMEI;
+    
+  } catch (e) {
+    btn.disabled = false;
+    btn.innerText = 'Pay Now';
+    alert('Payment failed: ' + e.message);
+  }
+}
+
+loadSchedules();
+</script>
+</body></html>`;
         return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       }
 
-      if (path === '/payment-success' || path === '/pay/payment-success') {
-        return new Response('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment Successful</title><style>body{font-family:sans-serif;background:#0F62FE;color:#fff;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}.box{background:#fff;color:#1a1a1a;padding:40px 24px;border-radius:16px;text-align:center;max-width:400px;}.check{font-size:72px;margin-bottom:16px;}h1{color:#0F62FE;font-size:24px;margin:0 0 8px;}</style></head><body><div class="box"><div class="check">✅</div><h1>Payment Received</h1><p>Your device will unlock momentarily.</p><p style="font-size:12px;margin-top:24px;">Signal Electronics • +256 706 352 822</p></div></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-      }
-
-      if (path === '/api/apk/latest' && request.method === 'GET') {
-        return json({ version: '0.2.1', apk_url: 'https://device-finance-api.whiteghostpheonix.workers.dev/download/apk/signal-dpc-v0.2.1-alpha.apk', released: '2026-10-02' });
-      }
-
-      if (path === '/api/devices' && request.method === 'POST') {
-        const { imei, customer_name, customer_phone, fcm_token, pending_plan_id, start_date } = await request.json();
-        const reseller = getResellerEmail(request);
-        const existing = await env.DB.prepare(`SELECT imei FROM devices WHERE imei = ?`).bind(imei).first();
-        if (existing) {
-          await env.DB.prepare(`UPDATE devices SET customer_name = COALESCE(?, customer_name), customer_phone = COALESCE(?, customer_phone), fcm_token = COALESCE(?, fcm_token), reseller_email = COALESCE(?, reseller_email) WHERE imei = ?`)
-            .bind(customer_name || null, customer_phone || null, fcm_token || null, reseller || null, imei).run();
+      // Public: Create order (Trigger STK Push via RohoPay)
+      if (path === '/public/create-order' && request.method === 'POST') {
+        const body = await request.json();
+        const { device_imei, mode = 'single', custom_amount_ugx, phone } = body;
+ 
+        if (!device_imei) return json({ error: 'device_imei required' }, 400);
+ 
+        const device = await env.DB.prepare(
+          `SELECT imei, customer_name, customer_phone, payment_code FROM devices WHERE imei = ?`
+        ).bind(device_imei).first();
+        if (!device) return json({ error: 'Device not found' }, 404);
+ 
+        const unpaid = await env.DB.prepare(
+          `SELECT id, installment_number, amount_due_ugx, amount_paid_ugx FROM schedules
+           WHERE device_imei = ? AND status IN ('pending','overdue') ORDER BY installment_number ASC`
+        ).bind(device_imei).all();
+        if (!unpaid.results?.length) return json({ error: 'No outstanding balance' }, 400);
+ 
+        const totalOwed = unpaid.results.reduce(
+          (sum, s) => sum + (s.amount_due_ugx - (s.amount_paid_ugx || 0)), 0
+        );
+ 
+        let amountToCharge = 0;
+ 
+        if (mode === 'custom') {
+          const requested = Math.round(Number(custom_amount_ugx) || 0);
+          if (requested < 500) return json({ error: 'Minimum payment is 500 UGX' }, 400);
+          if (requested > totalOwed) {
+            return json({ error: 'Maximum you can pay is ' + Math.round(totalOwed).toLocaleString() + ' UGX' }, 400);
+          }
+          amountToCharge = requested;
+        } else if (mode === 'single') {
+          amountToCharge = unpaid.results[0].amount_due_ugx - (unpaid.results[0].amount_paid_ugx || 0);
+        } else if (mode === 'full') {
+          amountToCharge = totalOwed;
         } else {
-          await env.DB.prepare(`INSERT INTO devices (imei, customer_name, customer_phone, fcm_token, reseller_email) VALUES (?, ?, ?, ?, ?)`)
-            .bind(imei, customer_name || 'Unknown', customer_phone || '', fcm_token || null, reseller || null).run();
+          return json({ error: 'Invalid mode' }, 400);
         }
-        let planAssigned = false;
-        if (pending_plan_id) {
-          const existingSchedule = await env.DB.prepare(`SELECT COUNT(*) as c FROM schedules WHERE device_imei = ?`).bind(imei).first();
-          if (existingSchedule.c === 0) {
-            const plan = await env.DB.prepare(`SELECT * FROM payment_plans WHERE id = ?`).bind(pending_plan_id).first();
-            if (plan) {
-              const installments = await env.DB.prepare(`SELECT * FROM plan_installments WHERE plan_id = ? ORDER BY installment_number`).bind(pending_plan_id).all();
-              if (installments.results?.length) {
-                const start = new Date(start_date || Date.now());
-                const stmts = installments.results.map(inst => {
-                  const dueDate = new Date(start);
-                  dueDate.setDate(dueDate.getDate() + Number(inst.offset_days || 0));
-                  return env.DB.prepare(`INSERT INTO schedules (device_imei, plan_id, installment_number, due_date, amount_due_ugx) VALUES (?, ?, ?, ?, ?)`)
-                    .bind(imei, pending_plan_id, inst.installment_number, dueDate.toISOString().split('T')[0], Number(inst.amount_ugx));
-                });
-                for (let i = 0; i < stmts.length; i += 20) await env.DB.batch(stmts.slice(i, i + 20));
-                planAssigned = true;
-                await logAudit(env, 'device', imei, 'plan_auto_assigned', { plan_id: pending_plan_id, installments: installments.results.length });
-              }
-            }
+ 
+        amountToCharge = Math.round(amountToCharge);
+        if (amountToCharge < 500) return json({ error: 'Minimum payment is 500 UGX' }, 400);
+ 
+        const merchantRef = 'SG-' + (device.payment_code || device.imei.slice(-4)) + '-' + Date.now().toString(36).toUpperCase();
+        
+        let rawPhone = phone || device.customer_phone || '';
+        rawPhone = rawPhone.replace(/\D/g, ''); 
+        if (rawPhone.startsWith('0')) rawPhone = '256' + rawPhone.slice(1);
+        if (rawPhone.startsWith('7') && rawPhone.length === 9) rawPhone = '256' + rawPhone;
+
+        if (!rawPhone || rawPhone.length < 12) {
+          return json({ error: 'A valid phone number is required for RohoPay' }, 400);
+        }
+
+        const callbackUrl = url.origin + '/api/rohopay-callback?ref=' + merchantRef;
+
+        try {
+          await collectPayment(env, {
+            phone: rawPhone,
+            amount: amountToCharge,
+            currency: 'UGX',
+            description: 'Device Installment - ' + device_imei,
+            callbackUrl: callbackUrl,
+          });
+
+          await env.DB.prepare(
+            `INSERT INTO transactions (device_imei, amount_ugx, payment_method, reference) VALUES (?, ?, ?, ?)`
+          ).bind(device_imei, amountToCharge, 'RohoPay', merchantRef).run();
+
+          return json({ 
+            success: true, 
+            message: 'STK Push sent. Check your phone to enter PIN.',
+            reference: merchantRef,
+          });
+
+        } catch (err) {
+          console.error('RohoPay collect error:', err);
+          return json({ error: err.message || 'Failed to initiate RohoPay collection' }, 500);
+        }
+      }
+
+if (path === '/api/rohopay-callback' && request.method === 'POST') {
+        const rawBody = await request.text();
+        const signature = request.headers.get('x-rohopay-signature') || '';
+        
+        const isValid = await verifyRohoWebhook(env, rawBody, signature);
+        if (!isValid) {
+          console.warn('Invalid RohoPay webhook signature');
+          return json({ error: 'Invalid signature' }, 401);
+        }
+
+        const payload = JSON.parse(rawBody);
+        console.log('RohoPay webhook success:', JSON.stringify(payload));
+
+        if (payload.event === 'deposit.successful' && payload.status === 'successful') {
+          const amount = payload.amount || 0;
+          const merchantRef = payload.reference;
+          
+          let deviceImei = null;
+          if (merchantRef && merchantRef.startsWith('SG-')) {
+             const parts = merchantRef.split('-');
+             if (parts.length >= 2) deviceImei = parts[1];
+          }
+
+          if (deviceImei && amount > 0) {
+             const unpaid = await env.DB.prepare(
+              `SELECT * FROM schedules WHERE device_imei = ? AND status != 'paid' ORDER BY installment_number ASC LIMIT 1`
+             ).bind(deviceImei).first();
+
+             if (unpaid) {
+                const newPaid = (unpaid.amount_paid_ugx || 0) + amount;
+                const newStatus = newPaid >= unpaid.amount_due_ugx ? 'paid' : 'partial';
+
+                await env.DB.prepare(
+                  `UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?`
+                ).bind(newPaid, newStatus, unpaid.id).run();
+
+                await env.DB.prepare(
+                  `UPDATE transactions SET status = 'completed' WHERE reference = ?`
+                ).bind(merchantRef).run();
+
+                await sendFcm(env, deviceImei, 'UNLOCK', { reason: 'payment_received' });
+             }
           }
         }
-        await logAudit(env, 'device', imei, 'registered', { customer_name, reseller, planAssigned });
-        return json({ success: true, imei, plan_assigned: planAssigned });
+
+        return json({ received: true });
       }
 
-      if (path.match(/^\/api\/devices\/[^/]+\/fcm$/) && request.method === 'PUT') {
-        const imei = path.split('/')[3];
-        const { fcm_token } = await request.json().catch(() => ({}));
-        if (!fcm_token) return json({ error: 'fcm_token required' }, 400);
-        await env.DB.prepare(`UPDATE devices SET fcm_token = ? WHERE imei = ?`).bind(fcm_token, imei).run();
-        return json({ success: true });
+      // Public: Processing Confirmation Page
+      // Public: Processing Confirmation Page
+      if (path === '/processing' && request.method === 'GET') {
+        const amount = url.searchParams.get('amount') || '0';
+        const phone = url.searchParams.get('phone') || 'your phone';
+        const ref = url.searchParams.get('ref') || '';
+        const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Processing Payment</title>
+<style>
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #060b14; color: #fff; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; text-align: center; overflow: hidden; }
+.state-container { display: none; flex-direction: column; align-items: center; animation: fadeIn 0.4s ease; width: 100%; max-width: 400px; }
+.state-container.active { display: flex; }
+@keyframes fadeIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+
+/* Loading State */
+.pulse-ring { width: 80px; height: 80px; border-radius: 50%; background: #3b82f6; margin: 0 auto 30px; position: relative; display: flex; align-items: center; justify-content: center; font-size: 32px; }
+.pulse-ring::before { content: ''; position: absolute; width: 100%; height: 100%; border-radius: 50%; background: #3b82f6; opacity: 0.6; animation: pulse 1.5s ease-out infinite; z-index: -1; }
+@keyframes pulse { 0% { transform: scale(1); opacity: 0.6; } 100% { transform: scale(1.5); opacity: 0; } }
+
+/* Success & Error Icons */
+.big-icon { font-size: 70px; margin-bottom: 20px; }
+.success .big-icon { color: #10b981; }
+.error .big-icon { color: #ef4444; }
+
+h1 { font-size: 26px; margin: 0 0 12px; letter-spacing: -0.5px; }
+p { color: #94a3b8; line-height: 1.6; font-size: 15px; margin: 0 0 20px; }
+.amount-card { background: rgba(30, 41, 59, 0.5); border: 1px solid rgba(255,255,255,0.1); padding: 20px; border-radius: 20px; margin-bottom: 30px; width: 100%; }
+.amount { font-size: 36px; font-weight: 800; color: #60a5fa; margin: 0; }
+.phone { font-weight: 600; color: #fff; }
+.btn { display: inline-block; padding: 16px 30px; background: #3b82f6; color: #fff; text-decoration: none; border-radius: 12px; font-weight: 700; width: 100%; border: none; font-size: 16px; }
+.btn-outline { background: transparent; border: 1px solid rgba(255,255,255,0.2); color: #94a3b8; }
+</style>
+</head>
+<body>
+
+  <!-- STATE 1: WAITING FOR PIN / WEBHOOK -->
+  <div class="state-container active" id="state-loading">
+    <div class="pulse-ring">📲</div>
+    <h1>Check Your Phone</h1>
+    <p>We sent a PIN prompt to <span class="phone">${phone}</span>. Please enter your PIN to authorize.</p>
+    <div class="amount-card">
+      <p style="font-size: 12px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px;">Amount</p>
+      <div class="amount">UGX ${Number(amount).toLocaleString()}</div>
+    </div>
+    <p style="font-size: 13px; color: #64748b; margin-bottom: 20px;">Waiting for confirmation...</p>
+    <button class="btn btn-outline" onclick="cancelPayment()">Cancel Payment</button>
+  </div>
+
+  <!-- STATE 2: SUCCESS -->
+  <div class="state-container success" id="state-success">
+    <div class="big-icon">✅</div>
+    <h1>Payment Successful</h1>
+    <p>Your payment of <strong>UGX ${Number(amount).toLocaleString()}</strong> has been received.</p>
+    <p style="font-size: 13px;">Your device schedule has been updated.</p>
+    <a href="/pay?imei=" class="btn" style="margin-top: 20px;" id="return-btn-success">Return to App</a>
+  </div>
+
+  <!-- STATE 3: ERROR / TIMEOUT -->
+  <div class="state-container error" id="state-error">
+    <div class="big-icon">❌</div>
+    <h1>Payment Not Received</h1>
+    <p>We could not confirm your payment. This usually means the PIN was cancelled or there were insufficient funds.</p>
+    <a href="/pay?imei=" class="btn" style="margin-top: 20px; background: #ef4444;" id="return-btn-error">Try Again</a>
+  </div>
+
+<script>
+const REF = ${JSON.stringify(ref)};
+const IMEI = new URLSearchParams(window.location.search).get('imei') || '';
+let pollCount = 0;
+let pollInterval;
+
+// Link the return buttons to the correct IMEI
+document.getElementById('return-btn-success').href = '/pay?imei=' + IMEI;
+document.getElementById('return-btn-error').href = '/pay?imei=' + IMEI;
+
+function switchState(stateId) {
+  document.querySelectorAll('.state-container').forEach(el => el.classList.remove('active'));
+  document.getElementById(stateId).classList.add('active');
+}
+
+function checkStatus() {
+  pollCount++;
+  
+  // If we've waited 60 seconds (20 polls * 3s), assume it failed/timed out
+  if (pollCount > 20) {
+    clearInterval(pollInterval);
+    switchState('state-error');
+    return;
+  }
+
+  fetch('/public/payment-status/' + REF)
+    .then(res => res.json())
+    .then(data => {
+      if (data.status === 'completed') {
+        clearInterval(pollInterval);
+        switchState('state-success');
+      } else if (data.status === 'failed') {
+        clearInterval(pollInterval);
+        switchState('state-error');
+      }
+      // If 'pending', do nothing, just wait for the next poll
+    })
+    .catch(err => console.log('Polling error', err));
+}
+
+function cancelPayment() {
+  clearInterval(pollInterval);
+  window.location.href = '/pay?imei=' + IMEI;
+}
+
+// Start polling every 3 seconds
+if (REF) {
+  pollInterval = setInterval(checkStatus, 3000);
+}
+</script>
+</body></html>`;
+        return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
       }
 
-      if (path.match(/^\/api\/devices\/[^/]+\/heartbeat$/) && request.method === 'POST') {
-        const imei = path.split('/')[3];
-        const body = await request.json().catch(() => ({}));
-        const device = await env.DB.prepare(`SELECT imei, status FROM devices WHERE imei = ?`).bind(imei).first();
-        if (!device) return json({ error: 'Device not registered' }, 404);
-        await logAudit(env, 'device', imei, 'heartbeat', body);
-        const schedules = await env.DB.prepare(
-          `SELECT s.installment_number, s.due_date, s.amount_due_ugx, s.amount_paid_ugx, s.status, (SELECT grace_period_days FROM payment_plans p WHERE p.id = s.plan_id) as grace_days FROM schedules s WHERE s.device_imei = ? ORDER BY s.installment_number`
-        ).bind(imei).all();
-        return json({ success: true, ts: Date.now(), device_status: device.status, schedule: schedules.results || [] });
-      }
 
-      if (path === '/api/device/ack' && request.method === 'POST') {
-        const { command_id } = await request.json().catch(() => ({}));
-        if (!command_id) return json({ error: 'command_id required' }, 400);
-        await env.DB.prepare(`UPDATE commands SET status = 'acknowledged', acknowledged_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(command_id).run();
-        await logAudit(env, 'command', command_id, 'acknowledged', { via: 'device' });
-        return json({ success: true, command_id });
-      }
 
-      if (path === '/api/device-status' && (request.method === 'GET' || request.method === 'HEAD')) {
+      // Public: Get schedule for a specific device
+      if (path === '/public/schedule' && request.method === 'GET') {
         const imei = url.searchParams.get('imei');
-        if (!imei) return json({ error: 'imei required' }, 400);
-        const device = await env.DB.prepare(`SELECT imei, status FROM devices WHERE imei = ?`).bind(imei).first();
-        if (!device) return json({ error: 'Not found' }, 404);
-        const overdueCount = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`).bind(imei).first();
-        const nextDue = await env.DB.prepare(`SELECT id, due_date, amount_due_ugx, amount_paid_ugx FROM schedules WHERE device_imei = ? AND status IN ('pending','overdue') ORDER BY due_date ASC LIMIT 1`).bind(imei).first();
-        return json({ imei: device.imei, status: device.status, overdue_count: overdueCount.cnt, next_due: nextDue || null });
-      }
+        if (!imei) return json({ error: 'IMEI required' }, 400);
+        
+        const device = await env.DB.prepare(
+          `SELECT imei, customer_name, status FROM devices WHERE imei = ?`
+        ).bind(imei).first();
+        
+        if (!device) return json({ error: 'Device not found' }, 404);
 
-      if (path === '/api/payments/auto' && request.method === 'POST') {
-        const { imei, schedule_id, amount_ugx, method, reference } = await request.json();
-        if (!imei || !amount_ugx) return json({ error: 'imei and amount_ugx required' }, 400);
-        let schedule;
-        if (schedule_id) schedule = await env.DB.prepare(`SELECT * FROM schedules WHERE id = ?`).bind(schedule_id).first();
-        else schedule = await env.DB.prepare(`SELECT * FROM schedules WHERE device_imei = ? AND status IN ('pending','overdue') ORDER BY installment_number ASC LIMIT 1`).bind(imei).first();
-        if (!schedule) return json({ error: 'No unpaid schedule found' }, 404);
-        const newPaid = (schedule.amount_paid_ugx || 0) + Number(amount_ugx);
-        const newStatus = newPaid >= schedule.amount_due_ugx ? 'paid' : schedule.status;
-        await env.DB.prepare(`UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?`).bind(newPaid, newStatus, schedule.id).run();
-        await env.DB.prepare(`INSERT INTO transactions (schedule_id, amount_ugx, payment_method, reference) VALUES (?, ?, ?, ?)`).bind(schedule.id, amount_ugx, method || 'unknown', reference || null).run();
-        await logAudit(env, 'schedule', schedule.id, 'payment_auto', { amount_ugx, method, reference, imei });
-        const overdueLeft = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`).bind(imei).first();
-        let unlocked = false;
-        if (overdueLeft.cnt === 0) {
-          await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(imei).run();
-          await queueCommand(env, imei, 'UNLOCK', 'payment_auto_cleared');
-          unlocked = true;
-        }
-        return json({ success: true, schedule_id: schedule.id, schedule_status: newStatus, device_unlocked: unlocked, overdue_remaining: overdueLeft.cnt });
-      }
+        const schedules = await env.DB.prepare(
+          `SELECT id, installment_number, amount_due_ugx, amount_paid_ugx, due_date, status 
+           FROM schedules WHERE device_imei = ? ORDER BY installment_number`
+        ).bind(imei).all();
 
-      if (path === '/api/payments/initiate' && request.method === 'POST') {
-        const { imei, amount_ugx, method } = await request.json();
-        if (!imei || !amount_ugx) return json({ error: 'imei and amount_ugx required' }, 400);
-        const intentId = 'PI-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-        await logAudit(env, 'payment_intent', intentId, 'created', { imei, amount_ugx, method });
-        return json({ success: true, intent_id: intentId, amount_ugx, instructions: method === 'mtn' ? 'Dial *165#' : method === 'airtel' ? 'Dial *185#' : 'Follow the prompt' });
-      }
-
-      if (path === '/api/dashboard/summary' && request.method === 'GET') {
-        const reseller = getResellerEmail(request);
-        if (reseller) {
-          const q = (sql) => env.DB.prepare(sql).bind(reseller).first();
-          const [td, ad, ld, od, tc, pc] = await Promise.all([
-            q(`SELECT COUNT(*) as c FROM devices WHERE reseller_email = ?`),
-            q(`SELECT COUNT(*) as c FROM devices WHERE status='active' AND reseller_email = ?`),
-            q(`SELECT COUNT(*) as c FROM devices WHERE status='locked' AND reseller_email = ?`),
-            q(`SELECT COUNT(*) as c FROM schedules WHERE status='overdue' AND device_imei IN (SELECT imei FROM devices WHERE reseller_email = ?)`),
-            q(`SELECT COALESCE(SUM(t.amount_ugx),0) as s FROM transactions t JOIN schedules s ON t.schedule_id = s.id WHERE s.device_imei IN (SELECT imei FROM devices WHERE reseller_email = ?)`),
-            q(`SELECT COUNT(*) as c FROM commands WHERE status='queued' AND device_imei IN (SELECT imei FROM devices WHERE reseller_email = ?)`),
-          ]);
-          return json({ total_devices: td.c, active_devices: ad.c, locked_devices: ld.c, overdue_schedules: od.c, total_collected_ugx: tc.s, pending_commands: pc.c });
-        }
-        const [td, ad, ld, od, tc, pc] = await Promise.all([
-          env.DB.prepare(`SELECT COUNT(*) as c FROM devices`).first(),
-          env.DB.prepare(`SELECT COUNT(*) as c FROM devices WHERE status='active'`).first(),
-          env.DB.prepare(`SELECT COUNT(*) as c FROM devices WHERE status='locked'`).first(),
-          env.DB.prepare(`SELECT COUNT(*) as c FROM schedules WHERE status='overdue'`).first(),
-          env.DB.prepare(`SELECT COALESCE(SUM(amount_ugx),0) as s FROM transactions`).first(),
-          env.DB.prepare(`SELECT COUNT(*) as c FROM commands WHERE status='queued'`).first(),
-        ]);
-        return json({ total_devices: td.c, active_devices: ad.c, locked_devices: ld.c, overdue_schedules: od.c, total_collected_ugx: tc.s, pending_commands: pc.c });
-      }
-
-      if (path === '/api/dashboard/devices' && request.method === 'GET') {
-        const reseller = getResellerEmail(request);
-        const base = `SELECT d.imei, d.customer_name, d.customer_phone, d.status, d.created_at, d.reseller_email, (SELECT COUNT(*) FROM schedules s WHERE s.device_imei = d.imei AND s.status = 'paid') as paid_count, (SELECT COUNT(*) FROM schedules s WHERE s.device_imei = d.imei) as total_count, (SELECT SUM(s.amount_due_ugx - COALESCE(s.amount_paid_ugx,0)) FROM schedules s WHERE s.device_imei = d.imei AND s.status != 'paid') as balance_ugx, (SELECT s.due_date FROM schedules s WHERE s.device_imei = d.imei AND s.status IN ('pending','overdue') ORDER BY s.due_date ASC LIMIT 1) as next_due_date FROM devices d`;
-        const rows = reseller
-          ? await env.DB.prepare(base + ` WHERE d.reseller_email = ? ORDER BY d.created_at DESC LIMIT 500`).bind(reseller).all()
-          : await env.DB.prepare(base + ` ORDER BY d.created_at DESC LIMIT 500`).all();
-        return json(rows.results);
-      }
-
-      if (path.match(/^\/api\/dashboard\/devices\/[^/]+$/) && request.method === 'GET') {
-        const imei = path.split('/').pop();
-        const device = await env.DB.prepare(`SELECT * FROM devices WHERE imei = ?`).bind(imei).first();
-        if (!device) return json({ error: 'Not found' }, 404);
-        const schedules = await env.DB.prepare(`SELECT * FROM schedules WHERE device_imei = ? ORDER BY installment_number`).bind(imei).all();
-        const transactions = await env.DB.prepare(`SELECT t.* FROM transactions t JOIN schedules s ON t.schedule_id = s.id WHERE s.device_imei = ? ORDER BY t.paid_at DESC LIMIT 50`).bind(imei).all();
-        const commands = await env.DB.prepare(`SELECT * FROM commands WHERE device_imei = ? ORDER BY created_at DESC LIMIT 20`).bind(imei).all();
-        const customer = await env.DB.prepare(`SELECT * FROM customers WHERE imei = ?`).bind(imei).first();
-        const guarantors = await env.DB.prepare(`SELECT * FROM guarantors WHERE customer_imei = ? ORDER BY slot`).bind(imei).all();
-        return json({ device, schedules: schedules.results, transactions: transactions.results, commands: commands.results, customer: customer || null, guarantors: guarantors.results || [] });
-      }
-
-      if (path === '/api/admin/run-overdue-check' && request.method === 'POST') {
-        const result = await detectOverdue(env);
-        return json({ success: true, ...result });
-      }
-
-      if (path === '/api/commands/lock' && request.method === 'POST') {
-        const { imei, reason } = await request.json();
-        if (!imei) return json({ error: 'imei required' }, 400);
-        await env.DB.prepare(`UPDATE devices SET status = 'locked' WHERE imei = ?`).bind(imei).run();
-        const cmd = await queueCommand(env, imei, 'LOCK', reason || 'manual');
-        return json({ success: true, command_id: cmd.id, deduplicated: cmd.deduplicated });
-      }
-      if (path === '/api/commands/unlock' && request.method === 'POST') {
-        const { imei, reason } = await request.json();
-        if (!imei) return json({ error: 'imei required' }, 400);
-        await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(imei).run();
-        const cmd = await queueCommand(env, imei, 'UNLOCK', reason || 'manual');
-        return json({ success: true, command_id: cmd.id, deduplicated: cmd.deduplicated });
-      }
-
-      if (path === '/api/commands' && request.method === 'GET') {
-        const status = url.searchParams.get('status');
-        const q = status
-          ? env.DB.prepare(`SELECT * FROM commands WHERE status = ? ORDER BY created_at DESC LIMIT 100`).bind(status)
-          : env.DB.prepare(`SELECT * FROM commands ORDER BY created_at DESC LIMIT 100`);
-        return json((await q.all()).results);
-      }
-
-      if (path === '/api/admin/test-push' && request.method === 'POST') {
-        const { fcm_token, action, reason } = await request.json();
-        if (!fcm_token) return json({ error: 'fcm_token required' }, 400);
-        try {
-          const resp = await sendFcm(env, fcm_token, { action: action || 'TEST', reason: reason || 'manual_test', ts: Date.now() });
-          return json({ success: true, fcm_response: resp });
-        } catch (err) { return json({ success: false, error: String(err.message || err) }, 500); }
-      }
-
-      if (path === '/api/admin/dispatch-queue' && request.method === 'POST') {
-        const result = await dispatchPendingCommands(env, 100);
-        return json({ success: true, ...result });
-      }
-
-      if (path === '/api/payments' && request.method === 'POST') {
-        const { schedule_id, amount_ugx, payment_method, reference } = await request.json();
-        if (!schedule_id || !amount_ugx) return json({ error: 'schedule_id and amount_ugx required' }, 400);
-        const schedule = await env.DB.prepare(`SELECT * FROM schedules WHERE id = ?`).bind(schedule_id).first();
-        if (!schedule) return json({ error: 'Schedule not found' }, 404);
-        const newPaid = (schedule.amount_paid_ugx || 0) + Number(amount_ugx);
-        const newStatus = newPaid >= schedule.amount_due_ugx ? 'paid' : schedule.status;
-        await env.DB.prepare(`UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?`).bind(newPaid, newStatus, schedule_id).run();
-        await env.DB.prepare(`INSERT INTO transactions (schedule_id, amount_ugx, payment_method, reference) VALUES (?, ?, ?, ?)`).bind(schedule_id, amount_ugx, payment_method || 'unknown', reference || null).run();
-        await logAudit(env, 'schedule', schedule_id, 'payment_recorded', { amount_ugx, payment_method, reference });
-        const overdueLeft = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`).bind(schedule.device_imei).first();
-        let unlocked = false;
-        if (overdueLeft.cnt === 0) {
-          await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(schedule.device_imei).run();
-          await queueCommand(env, schedule.device_imei, 'UNLOCK', 'overdue_cleared');
-          unlocked = true;
-        }
-        return json({ success: true, schedule_status: newStatus, device_unlocked: unlocked, overdue_remaining: overdueLeft.cnt });
-      }
-
-      if (path === '/api/audit' && request.method === 'GET') {
-        const limit = Number(url.searchParams.get('limit') || 100);
-        const rows = await env.DB.prepare(`SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?`).bind(limit).all();
-        return json(rows.results);
-      }
-
-      // ═══════════════════════════════════════════
-      // PLANS — amount × period model
-      // ═══════════════════════════════════════════
-      if (path === '/api/plans' && request.method === 'POST') {
-        const body = await request.json();
-        const { plan_name, grace_period_days, frequency, amount_per_period, period_count, has_deposit, deposit_amount, deposit_due_days, notes } = body;
-        if (!plan_name) return json({ error: 'plan_name required' }, 400);
-        if (!amount_per_period || !period_count || !frequency) return json({ error: 'amount_per_period, period_count, and frequency required' }, 400);
-        const count = Number(period_count);
-        if (count < 1 || count > 2000) return json({ error: 'period_count must be 1-2000' }, 400);
-        const amount = Number(amount_per_period);
-        const deposit = has_deposit ? Number(deposit_amount || 0) : 0;
-        const total = amount * count + deposit;
-        const stepDays = frequency === 'daily' ? 1 : frequency === 'weekly' ? 7 : 30;
-        const result = await env.DB.prepare(
-          `INSERT INTO payment_plans (plan_name, total_amount_ugx, installment_count, grace_period_days, frequency, notes, amount_per_period, period_type, period_count, has_deposit, deposit_amount, deposit_due_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).bind(plan_name, total, count, grace_period_days || 3, frequency, notes || null, amount, frequency, count, has_deposit ? 1 : 0, deposit, has_deposit ? (deposit_due_days || 0) : 0).run();
-        const planId = result.meta.last_row_id;
-        const allInstallments = [];
-        if (has_deposit && deposit > 0) allInstallments.push({ offset_days: Number(deposit_due_days || 0), amount_ugx: deposit, label: 'Deposit' });
-        for (let i = 0; i < count; i++) {
-          const offset = (has_deposit ? Number(deposit_due_days || 0) : 0) + (i + 1) * stepDays;
-          allInstallments.push({ offset_days: offset, amount_ugx: amount, label: `${frequency}_${i + 1}` });
-        }
-        for (let i = 0; i < allInstallments.length; i += 20) {
-          const chunk = allInstallments.slice(i, i + 20);
-          const stmts = chunk.map((inst, idx) => env.DB.prepare(
-            `INSERT INTO plan_installments (plan_id, installment_number, offset_days, amount_ugx, label) VALUES (?, ?, ?, ?, ?)`
-          ).bind(planId, i + idx + 1, inst.offset_days, inst.amount_ugx, inst.label));
-          await env.DB.batch(stmts);
-        }
-        await logAudit(env, 'plan', planId, 'created', { plan_name, frequency, period_count: count, amount, total });
-        return json({ success: true, plan_id: planId, total, period_count: count, amount_per_period: amount, deposit });
-      }
-
-      if (path === '/api/plans' && request.method === 'GET') {
-        const rows = await env.DB.prepare(`SELECT * FROM payment_plans ORDER BY created_at DESC`).all();
-        return json(rows.results);
-      }
-
-      if (path.match(/^\/api\/plans\/\d+$/) && request.method === 'GET') {
-        const id = Number(path.split('/').pop());
-        const plan = await env.DB.prepare(`SELECT * FROM payment_plans WHERE id = ?`).bind(id).first();
-        if (!plan) return json({ error: 'Not found' }, 404);
-        const installments = await env.DB.prepare(`SELECT * FROM plan_installments WHERE plan_id = ? ORDER BY installment_number`).bind(id).all();
-        return json({ ...plan, installments: installments.results || [] });
-      }
-
-      if (path.match(/^\/api\/plans\/\d+$/) && request.method === 'PUT') {
-        const id = Number(path.split('/').pop());
-        const body = await request.json();
-        const plan = await env.DB.prepare(`SELECT * FROM payment_plans WHERE id = ?`).bind(id).first();
-        if (!plan) return json({ error: 'Not found' }, 404);
-        await env.DB.prepare(`UPDATE payment_plans SET plan_name=?, grace_period_days=?, notes=? WHERE id=?`)
-          .bind(body.plan_name || plan.plan_name, body.grace_period_days ?? plan.grace_period_days, body.notes ?? plan.notes, id).run();
-        return json({ success: true, plan_id: id });
-      }
-
-      if (path === '/api/assign-plan' && request.method === 'POST') {
-        const { imei, plan_id, start_date } = await request.json();
-        const plan = await env.DB.prepare(`SELECT * FROM payment_plans WHERE id = ?`).bind(plan_id).first();
-        if (!plan) return json({ error: 'Plan not found' }, 404);
-        const installments = await env.DB.prepare(`SELECT * FROM plan_installments WHERE plan_id = ? ORDER BY installment_number`).bind(plan_id).all();
-        if (!installments.results?.length) return json({ error: 'Plan has no installments' }, 400);
-        const start = new Date(start_date || Date.now());
-        const stmts = installments.results.map(inst => {
-          const dueDate = new Date(start);
-          dueDate.setDate(dueDate.getDate() + Number(inst.offset_days || 0));
-          return env.DB.prepare(`INSERT INTO schedules (device_imei, plan_id, installment_number, due_date, amount_due_ugx) VALUES (?, ?, ?, ?, ?)`)
-            .bind(imei, plan_id, inst.installment_number, dueDate.toISOString().split('T')[0], Number(inst.amount_ugx));
+        return json({
+          device: device,
+          schedule: schedules.results || []
         });
-        for (let i = 0; i < stmts.length; i += 20) await env.DB.batch(stmts.slice(i, i + 20));
-        await logAudit(env, 'device', imei, 'plan_assigned', { plan_id, installments: installments.results.length });
-        return json({ success: true, installments_created: installments.results.length, total: plan.total_amount_ugx });
       }
 
-      // ═══════════════════════════════════════════
-      // CUSTOMERS (KYC + NIN uniqueness)
-      // ═══════════════════════════════════════════
-      if (path === '/api/customers' && request.method === 'POST') {
-        const body = await request.json();
-        const { imei, full_name, phone, nin, dob, address, occupation, monthly_income, photo_base64, photo_with_reseller_base64, device_photo_base64, id_front_base64, id_back_base64 } = body;
-        if (!imei || !full_name) return json({ error: 'imei and full_name required' }, 400);
-        const ninCheck = validateUgandaNIN(nin);
-        if (!ninCheck.valid) return json({ error: ninCheck.reason, kyc_status: 'rejected' }, 400);
-        const dup = await env.DB.prepare(`SELECT imei FROM customers WHERE nin = ? AND imei != ?`).bind(ninCheck.normalized, imei).first();
-        if (dup) return json({ error: 'This NIN is already registered to another device', kyc_status: 'rejected' }, 400);
-        const dupR = await env.DB.prepare(`SELECT email FROM resellers WHERE nin = ?`).bind(ninCheck.normalized).first();
-        if (dupR) return json({ error: 'This NIN belongs to a reseller', kyc_status: 'rejected' }, 400);
-        const dupG = await env.DB.prepare(`SELECT customer_imei FROM guarantors WHERE nin = ?`).bind(ninCheck.normalized).first();
-        if (dupG) return json({ error: 'This NIN is registered as a guarantor', kyc_status: 'rejected' }, 400);
-
-        const photoUrl = photo_base64 ? await saveImageToR2(env, `customers/${imei}/photo.jpg`, photo_base64, 'image/jpeg') : null;
-        const withResellerUrl = photo_with_reseller_base64 ? await saveImageToR2(env, `customers/${imei}/with-reseller.jpg`, photo_with_reseller_base64, 'image/jpeg') : null;
-        const devicePhotoUrl = device_photo_base64 ? await saveImageToR2(env, `customers/${imei}/device.jpg`, device_photo_base64, 'image/jpeg') : null;
-        const idFrontUrl = id_front_base64 ? await saveImageToR2(env, `customers/${imei}/id-front.jpg`, id_front_base64, 'image/jpeg') : null;
-        const idBackUrl = id_back_base64 ? await saveImageToR2(env, `customers/${imei}/id-back.jpg`, id_back_base64, 'image/jpeg') : null;
-
-        const existing = await env.DB.prepare(`SELECT id FROM customers WHERE imei = ?`).bind(imei).first();
-        if (existing) {
-          await env.DB.prepare(`UPDATE customers SET full_name=?, phone=?, nin=?, dob=?, address=?, occupation=?, monthly_income=?, photo_url=COALESCE(?, photo_url), photo_with_reseller_url=COALESCE(?, photo_with_reseller_url), device_photo_url=COALESCE(?, device_photo_url), id_front_url=COALESCE(?, id_front_url), id_back_url=COALESCE(?, id_back_url), nin_verified=1, kyc_status='verified', updated_at=CURRENT_TIMESTAMP WHERE imei=?`)
-            .bind(full_name, phone || null, ninCheck.normalized, dob || null, address || null, occupation || null, monthly_income || null, photoUrl, withResellerUrl, devicePhotoUrl, idFrontUrl, idBackUrl, imei).run();
-        } else {
-          await env.DB.prepare(`INSERT INTO customers (imei, full_name, phone, nin, dob, address, occupation, monthly_income, photo_url, photo_with_reseller_url, device_photo_url, id_front_url, id_back_url, nin_verified, kyc_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'verified')`)
-            .bind(imei, full_name, phone || null, ninCheck.normalized, dob || null, address || null, occupation || null, monthly_income || null, photoUrl, withResellerUrl, devicePhotoUrl, idFrontUrl, idBackUrl).run();
-        }
-        await logAudit(env, 'customer', imei, 'kyc_saved', { full_name, nin: ninCheck.normalized });
-        return json({ success: true, imei, nin_verified: true, kyc_status: 'verified' });
-      }
-
-      if (path.match(/^\/api\/customers\/[^/]+$/) && request.method === 'GET') {
-        const imei = path.split('/')[3];
-        const customer = await env.DB.prepare(`SELECT * FROM customers WHERE imei = ?`).bind(imei).first();
-        const guarantors = await env.DB.prepare(`SELECT * FROM guarantors WHERE customer_imei = ? ORDER BY slot`).bind(imei).all();
-        return json({ customer: customer || null, guarantors: guarantors.results || [] });
-      }
-
-      if (path.match(/^\/api\/customers\/[^/]+\/guarantors$/) && request.method === 'POST') {
-        const imei = path.split('/')[3];
-        const body = await request.json();
-        const { slot, full_name, phone, nin, relationship, address, occupation, photo_base64, id_front_base64 } = body;
-        if (!slot || slot < 1 || slot > 2) return json({ error: 'slot must be 1 or 2' }, 400);
-        let ninNorm = null;
-        if (nin && nin.trim()) {
-          const c = validateUgandaNIN(nin);
-          if (!c.valid) return json({ error: `Guarantor ${slot}: ${c.reason}` }, 400);
-          ninNorm = c.normalized;
-          const dC = await env.DB.prepare(`SELECT imei FROM customers WHERE nin = ?`).bind(ninNorm).first();
-          if (dC && dC.imei !== imei) return json({ error: `Guarantor ${slot}: NIN already used` }, 400);
-          const dR = await env.DB.prepare(`SELECT email FROM resellers WHERE nin = ?`).bind(ninNorm).first();
-          if (dR) return json({ error: `Guarantor ${slot}: NIN belongs to reseller` }, 400);
-          const dG = await env.DB.prepare(`SELECT customer_imei FROM guarantors WHERE nin = ? AND NOT (customer_imei = ? AND slot = ?)`).bind(ninNorm, imei, slot).first();
-          if (dG) return json({ error: `Guarantor ${slot}: NIN already registered` }, 400);
-        }
-        const photoUrl = photo_base64 ? await saveImageToR2(env, `customers/${imei}/guarantor-${slot}.jpg`, photo_base64, 'image/jpeg') : null;
-        const idFrontUrl = id_front_base64 ? await saveImageToR2(env, `customers/${imei}/guarantor-${slot}-id.jpg`, id_front_base64, 'image/jpeg') : null;
-        const existing = await env.DB.prepare(`SELECT id FROM guarantors WHERE customer_imei = ? AND slot = ?`).bind(imei, slot).first();
-        if (existing) {
-          await env.DB.prepare(`UPDATE guarantors SET full_name=?, phone=?, nin=?, relationship=?, address=?, occupation=?, photo_url=COALESCE(?, photo_url), id_front_url=COALESCE(?, id_front_url), updated_at=CURRENT_TIMESTAMP WHERE id=?`)
-            .bind(full_name || null, phone || null, ninNorm, relationship || null, address || null, occupation || null, photoUrl, idFrontUrl, existing.id).run();
-        } else {
-          await env.DB.prepare(`INSERT INTO guarantors (customer_imei, slot, full_name, phone, nin, relationship, address, occupation, photo_url, id_front_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-            .bind(imei, slot, full_name || null, phone || null, ninNorm, relationship || null, address || null, occupation || null, photoUrl, idFrontUrl).run();
-        }
-        await logAudit(env, 'guarantor', imei, 'saved', { slot, full_name, nin: ninNorm });
-        return json({ success: true, imei, slot });
-      }
-
-      // ═══════════════════════════════════════════
-      // RESELLERS
-      // ═══════════════════════════════════════════
-      if (path === '/api/resellers' && request.method === 'POST') {
-        const body = await request.json();
-        const { email, name, phone, region, address, nin, occupation, photo_base64, id_front_base64, id_back_base64 } = body;
-        if (!email) return json({ error: 'email required' }, 400);
-        let ninNorm = null;
-        if (nin && nin.trim()) {
-          const c = validateUgandaNIN(nin);
-          if (!c.valid) return json({ error: c.reason }, 400);
-          ninNorm = c.normalized;
-          const d = await env.DB.prepare(`SELECT email FROM resellers WHERE nin = ? AND email != ?`).bind(ninNorm, email).first();
-          if (d) return json({ error: 'NIN already registered to another reseller' }, 400);
-          const dC = await env.DB.prepare(`SELECT imei FROM customers WHERE nin = ?`).bind(ninNorm).first();
-          if (dC) return json({ error: 'NIN already used as customer' }, 400);
-          const dG = await env.DB.prepare(`SELECT customer_imei FROM guarantors WHERE nin = ?`).bind(ninNorm).first();
-          if (dG) return json({ error: 'NIN already used as guarantor' }, 400);
-        }
-        const safeEmail = email.replace(/[^a-z0-9]/gi, '_');
-        const photoUrl = photo_base64 ? await saveImageToR2(env, `resellers/${safeEmail}/photo.jpg`, photo_base64, 'image/jpeg') : null;
-        const idFrontUrl = id_front_base64 ? await saveImageToR2(env, `resellers/${safeEmail}/id-front.jpg`, id_front_base64, 'image/jpeg') : null;
-        const idBackUrl = id_back_base64 ? await saveImageToR2(env, `resellers/${safeEmail}/id-back.jpg`, id_back_base64, 'image/jpeg') : null;
-        const existing = await env.DB.prepare(`SELECT email FROM resellers WHERE email = ?`).bind(email).first();
-        if (existing) {
-          await env.DB.prepare(`UPDATE resellers SET name=?, phone=?, region=?, address=?, nin=?, occupation=?, photo_url=COALESCE(?, photo_url), id_front_url=COALESCE(?, id_front_url), id_back_url=COALESCE(?, id_back_url), nin_verified=1, updated_at=CURRENT_TIMESTAMP WHERE email=?`)
-            .bind(name || null, phone || null, region || null, address || null, ninNorm, occupation || null, photoUrl, idFrontUrl, idBackUrl, email).run();
-        } else {
-          await env.DB.prepare(`INSERT INTO resellers (email, name, phone, region, address, nin, occupation, photo_url, id_front_url, id_back_url, nin_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`)
-            .bind(email, name || null, phone || null, region || null, address || null, ninNorm, occupation || null, photoUrl, idFrontUrl, idBackUrl).run();
-        }
-        await logAudit(env, 'reseller', email, 'kyc_saved', { name, nin: ninNorm });
-        return json({ success: true, email, nin_verified: true });
-      }
-
-      if (path === '/api/resellers' && request.method === 'GET') {
-        const rows = await env.DB.prepare(`SELECT * FROM resellers ORDER BY created_at DESC`).all();
-        return json(rows.results || []);
-      }
-
-      if (path.match(/^\/api\/resellers\/[^/]+$/) && request.method === 'GET') {
-        const email = decodeURIComponent(path.split('/')[3]);
-        const row = await env.DB.prepare(`SELECT * FROM resellers WHERE email = ?`).bind(email).first();
-        return json(row || null);
-      }
-
-      if (path === '/api/validate-nin' && request.method === 'POST') {
-        const { nin } = await request.json();
-        const c = validateUgandaNIN(nin);
-        if (!c.valid) return json({ valid: false, reason: c.reason });
-        const dC = await env.DB.prepare(`SELECT imei FROM customers WHERE nin = ?`).bind(c.normalized).first();
-        const dR = await env.DB.prepare(`SELECT email FROM resellers WHERE nin = ?`).bind(c.normalized).first();
-        const dG = await env.DB.prepare(`SELECT customer_imei FROM guarantors WHERE nin = ?`).bind(c.normalized).first();
-        if (dC || dR || dG) return json({ valid: false, reason: 'NIN already registered' });
-        return json({ valid: true, normalized: c.normalized });
-      }
-
-      if (path.match(/^\/api\/devices\/[^/]+\/qr$/) && request.method === 'GET') {
-        const imei = path.split('/')[3];
-        const APK_KEY = 'signal-dpc-v0.2.1-alpha.apk';
-        const APK_URL = 'https://device-finance-api.whiteghostpheonix.workers.dev/download/apk/' + APK_KEY;
-        const COMPONENT = 'ug.co.signalelectronics.devicefinance/.SignalDeviceAdminReceiver';
-        let checksumB64 = '';
-        try {
-          const apk = await env.APK_BUCKET.get(APK_KEY);
-          if (apk) {
-            const bytes = await apk.arrayBuffer();
-            const hashBuf = await crypto.subtle.digest('SHA-256', bytes);
-            checksumB64 = btoa(String.fromCharCode(...new Uint8Array(hashBuf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-          }
-        } catch (e) { return json({ error: 'R2 read failed' }, 500); }
-        if (!checksumB64) return json({ error: 'APK not in R2' }, 404);
-        const payload = {
-          'android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME': COMPONENT,
-          'android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_DOWNLOAD_LOCATION': APK_URL,
-          'android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_CHECKSUM': checksumB64,
-          'android.app.extra.PROVISIONING_LEAVE_ALL_SYSTEM_APPS_ENABLED': true,
-          'android.app.extra.PROVISIONING_SKIP_ENCRYPTION': true,
-          'android.app.extra.PROVISIONING_SKIP_USER_SETUP': true,
-          'android.app.extra.PROVISIONING_ADMIN_EXTRAS_BUNDLE': { server_url: 'https://device-finance-api.whiteghostpheonix.workers.dev' },
-        };
-        return json({ imei, payload, payload_json: JSON.stringify(payload) });
+      // Public: Check payment status
+      if (path.startsWith('/public/payment-status/') && request.method === 'GET') {
+        const ref = path.split('/').pop();
+        const txn = await env.DB.prepare(
+          `SELECT status FROM transactions WHERE reference = ?`
+        ).bind(ref).first();
+        
+        if (!txn) return json({ status: 'pending' }); // Not in DB yet
+        return json({ status: txn.status }); // 'pending', 'completed', 'failed'
       }
 
       return json({ error: 'Not found', path }, 404);

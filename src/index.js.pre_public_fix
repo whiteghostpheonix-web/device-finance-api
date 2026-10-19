@@ -1,0 +1,1281 @@
+import { getAccessToken, registerIpn, listIpns, submitOrder, getTransactionStatus } from './pesapal.js';
+import { sendFcm } from './fcm.js';
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, CF-Access-Client-Id, CF-Access-Client-Secret',
+};
+
+function json(data, status = 200) {
+  return Response.json(data, { status, headers: corsHeaders });
+}
+
+function getResellerEmail(request) {
+  return request.headers.get('cf-access-authenticated-user-email') || null;
+}
+
+function validateUgandaNIN(nin) {
+  if (!nin || typeof nin !== 'string') return { valid: false, reason: 'NIN is required' };
+  const trimmed = nin.trim().toUpperCase();
+  if (!/^(CM|CF)[A-Z0-9]{12}$/.test(trimmed)) {
+    return { valid: false, reason: 'Invalid Uganda NIN format. Expected CM/CF + 12 characters' };
+  }
+  return { valid: true, normalized: trimmed };
+}
+
+function decodeBase64ToArrayBuffer(b64) {
+  const clean = b64.includes(',') ? b64.split(',')[1] : b64;
+  const bin = atob(clean);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function saveImageToR2(env, path, base64Data, contentType) {
+  const buffer = decodeBase64ToArrayBuffer(base64Data);
+  await env.MEDIA_BUCKET.put(path, buffer, {
+    httpMetadata: { contentType: contentType || 'image/jpeg' },
+  });
+  return 'https://device-finance-api.whiteghostpheonix.workers.dev/media/' + path;
+}
+
+async function logAudit(env, entity, entity_id, action, details) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO audit_log (entity, entity_id, action, details) VALUES (?, ?, ?, ?)`
+    ).bind(entity, String(entity_id), action,
+      typeof details === 'string' ? details : JSON.stringify(details)).run();
+  } catch (_) {}
+}
+
+// Generate a short payment code for a device (6 chars: SG + 4 alphanumeric)
+function generatePaymentCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = 'SG';
+  for (let i = 0; i < 4; i++) {
+    code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return code;
+}
+
+// Find a device by payment code, IMEI, or phone number
+async function findDeviceForPayment(env, { code, phone, amount }) {
+  // Try payment code first
+  if (code) {
+    const byCode = await env.DB.prepare(
+      `SELECT imei, customer_phone FROM devices WHERE payment_code = ?`
+    ).bind(code.toUpperCase()).first();
+    if (byCode) return { device: byCode, method: 'code' };
+  }
+
+  // Try phone number (last 9 digits to be flexible)
+  if (phone) {
+    const digits = phone.replace(/\D/g, '');
+    const last9 = digits.slice(-9);
+    if (last9.length >= 9) {
+      const byPhone = await env.DB.prepare(
+        `SELECT imei, customer_phone FROM devices WHERE REPLACE(REPLACE(customer_phone, '+', ''), ' ', '') LIKE ?`
+      ).bind('%' + last9).first();
+      if (byPhone) return { device: byPhone, method: 'phone' };
+    }
+  }
+
+  // Try to find by amount + most recent unpaid schedule
+  if (amount) {
+    // Find a device with an overdue schedule close to this amount
+    const byAmount = await env.DB.prepare(
+      `SELECT s.device_imei as imei, d.customer_phone FROM schedules s
+       JOIN devices d ON s.device_imei = d.imei
+       WHERE s.status IN ('pending','overdue')
+         AND ABS(s.amount_due_ugx - COALESCE(s.amount_paid_ugx, 0) - ?) < 100
+       ORDER BY s.due_date ASC LIMIT 1`
+    ).bind(amount).first();
+    if (byAmount) return { device: byAmount, method: 'amount' };
+  }
+
+  return { device: null, method: null };
+}
+
+async function queueCommand(env, imei, command, reason) {
+  const last = await env.DB.prepare(
+    `SELECT id, command, status FROM commands WHERE device_imei = ? ORDER BY id DESC LIMIT 1`
+  ).bind(imei).first();
+  const existing = (last && last.command === command
+    && (last.status === 'queued' || last.status === 'sent')) ? last : null;
+  if (existing) return { id: existing.id, deduplicated: true };
+
+  const payload = JSON.stringify({ action: command, reason, ts: Date.now() });
+  const result = await env.DB.prepare(
+    `INSERT INTO commands (device_imei, command, reason, status, payload) VALUES (?, ?, ?, 'queued', ?)`
+  ).bind(imei, command, reason, payload).run();
+  await logAudit(env, 'command', result.meta.last_row_id, 'queued', { imei, command, reason });
+  try { await dispatchPendingCommands(env, 5); } catch (_) {}
+  return { id: result.meta.last_row_id, deduplicated: false };
+}
+
+async function dispatchPendingCommands(env, limit = 50) {
+  const rows = await env.DB.prepare(
+    `SELECT c.*, d.fcm_token FROM commands c
+     JOIN devices d ON c.device_imei = d.imei
+     WHERE c.status = 'queued' ORDER BY c.created_at ASC LIMIT ?`
+  ).bind(limit).all();
+  const results = { attempted: 0, sent: 0, failed: 0, skipped_no_token: 0 };
+  for (const cmd of rows.results) {
+    results.attempted++;
+    if (!cmd.fcm_token) {
+      results.skipped_no_token++;
+      await env.DB.prepare(`UPDATE commands SET attempts = attempts + 1, error_message = 'no_fcm_token' WHERE id = ?`).bind(cmd.id).run();
+      continue;
+    }
+    try {
+      const payload = JSON.parse(cmd.payload || '{}');
+      await sendFcm(env, cmd.fcm_token, payload);
+      await env.DB.prepare(
+        `UPDATE commands SET status = 'sent', sent_at = CURRENT_TIMESTAMP, attempts = attempts + 1, error_message = NULL WHERE id = ?`
+      ).bind(cmd.id).run();
+      await logAudit(env, 'command', cmd.id, 'sent', { imei: cmd.device_imei });
+      results.sent++;
+    } catch (err) {
+      await env.DB.prepare(
+        `UPDATE commands SET attempts = attempts + 1, error_message = ? WHERE id = ?`
+      ).bind(String(err.message || err).slice(0, 500), cmd.id).run();
+      await logAudit(env, 'command', cmd.id, 'send_failed', { error: String(err.message || err) });
+      results.failed++;
+    }
+  }
+  return results;
+}
+
+async function detectOverdue(env) {
+  const overdue = await env.DB.prepare(`
+    SELECT s.id, s.device_imei FROM schedules s
+    WHERE s.status = 'pending'
+      AND date(s.due_date, '+' || COALESCE((SELECT grace_period_days FROM payment_plans p WHERE p.id = s.plan_id), 3) || ' days') < date('now')
+  `).all();
+  const results = { marked_overdue: 0, devices_locked: 0, commands_queued: 0, commands_deduplicated: 0 };
+  const touched = new Set();
+  for (const row of overdue.results) {
+    await env.DB.prepare(`UPDATE schedules SET status = 'overdue' WHERE id = ?`).bind(row.id).run();
+    results.marked_overdue++;
+    touched.add(row.device_imei);
+  }
+  for (const imei of touched) {
+    const device = await env.DB.prepare(`SELECT status FROM devices WHERE imei = ?`).bind(imei).first();
+    if (device && device.status !== 'locked') {
+      await env.DB.prepare(`UPDATE devices SET status = 'locked' WHERE imei = ?`).bind(imei).run();
+      results.devices_locked++;
+    }
+    const cmd = await queueCommand(env, imei, 'LOCK', 'overdue');
+    if (cmd.deduplicated) results.commands_deduplicated++; else results.commands_queued++;
+  }
+  return results;
+}
+
+// ═════════════════════════════════════════════
+// Payment processing (shared by webhook + sandbox)
+// ═════════════════════════════════════════════
+async function processIncomingPayment(env, {
+  provider, provider_tx_id, amount_ugx, currency, phone,
+  reference, payment_code, fee_amount, raw_payload,
+}) {
+  // 1. Check idempotency
+  if (provider_tx_id) {
+    const existing = await env.DB.prepare(
+      `SELECT id FROM webhook_events WHERE provider = ? AND event_id = ?`
+    ).bind(provider, provider_tx_id).first();
+    if (existing) {
+      return { success: true, duplicate: true, message: 'Already processed' };
+    }
+  }
+
+  // 2. Record the webhook event
+  const eventResult = await env.DB.prepare(
+    `INSERT INTO webhook_events (provider, event_id, event_type, payload) VALUES (?, ?, ?, ?)`
+  ).bind(provider, provider_tx_id || 'unknown_' + Date.now(), 'charge.completed', JSON.stringify(raw_payload)).run();
+  const webhookEventId = eventResult.meta.last_row_id;
+
+  // 3. Match to a device
+  const { device, method } = await findDeviceForPayment(env, {
+    code: payment_code || reference,
+    phone,
+    amount: amount_ugx,
+  });
+
+  if (!device) {
+    await logAudit(env, 'payment', webhookEventId, 'unmatched', { provider, amount_ugx, phone, reference });
+    return { success: false, message: 'No matching device found', webhook_event_id: webhookEventId };
+  }
+
+  const imei = device.imei;
+
+  // 4. Get ALL unpaid schedules (to support multi-installment payments)
+  const unpaid = await env.DB.prepare(
+    `SELECT * FROM schedules WHERE device_imei = ? AND status IN ('pending','overdue')
+     ORDER BY installment_number ASC`
+  ).bind(imei).all();
+
+  if (!unpaid.results?.length) {
+    await logAudit(env, 'payment', webhookEventId, 'no_schedule', { imei, amount_ugx });
+    return { success: false, message: 'Device has no unpaid schedule', imei };
+  }
+
+  // 5. Apply the payment across schedules (oldest first)
+  let remaining = Number(amount_ugx);
+  const paidSchedules = [];
+  let firstScheduleId = null;
+
+  for (const s of unpaid.results) {
+    if (remaining <= 0) break;
+    const owed = s.amount_due_ugx - (s.amount_paid_ugx || 0);
+    const applied = Math.min(remaining, owed);
+    const newPaid = (s.amount_paid_ugx || 0) + applied;
+    const newStatus = newPaid >= s.amount_due_ugx ? 'paid' : s.status;
+
+    await env.DB.prepare(
+      `UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?`
+    ).bind(newPaid, newStatus, s.id).run();
+
+    if (newStatus === 'paid') paidSchedules.push(s.id);
+    if (!firstScheduleId) firstScheduleId = s.id;
+
+    remaining -= applied;
+  }
+
+  // 6. Record a single transaction for the whole payment (attached to first schedule)
+  const txResult = await env.DB.prepare(
+    `INSERT INTO transactions (schedule_id, amount_ugx, payment_method, reference, provider, provider_tx_id, provider_payload, fee_amount, net_amount)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    firstScheduleId, amount_ugx, provider, reference || provider_tx_id,
+    provider, provider_tx_id, JSON.stringify(raw_payload),
+    fee_amount || 0, Number(amount_ugx) - (fee_amount || 0)
+  ).run();
+
+  // 7. Record the match
+  await env.DB.prepare(
+    `INSERT INTO payment_matches (webhook_event_id, device_imei, schedule_id, match_method, amount_ugx, status)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(webhookEventId, imei, firstScheduleId, method, amount_ugx, 'paid').run();
+
+  await logAudit(env, 'payment', txResult.meta.last_row_id, 'recorded', {
+    imei, amount_ugx, provider, provider_tx_id, schedule_ids_paid: paidSchedules, method,
+    schedules_cleared: paidSchedules.length,
+  });
+
+  const newStatus = paidSchedules.length > 0 ? 'paid' : 'pending';
+
+  // 8. Check if overdue is cleared → unlock
+  const overdueLeft = await env.DB.prepare(
+    `SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`
+  ).bind(imei).first();
+
+  let unlocked = false;
+  if (overdueLeft.cnt === 0) {
+    await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(imei).run();
+    await queueCommand(env, imei, 'UNLOCK', 'payment_received');
+    unlocked = true;
+    await logAudit(env, 'device', imei, 'auto_unlocked', { reason: 'payment_cleared', tx_id: txResult.meta.last_row_id });
+  }
+
+  return {
+    success: true,
+    imei,
+    schedule_id: firstScheduleId,
+    schedule_status: newStatus,
+    device_unlocked: unlocked,
+    overdue_remaining: overdueLeft.cnt,
+    match_method: method,
+    transaction_id: txResult.meta.last_row_id,
+  };
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
+
+    try {
+      // ── Health ────────────────────────────────
+      if (path === '/health') return json({ status: 'ok', market: 'Uganda', time: new Date().toISOString() });
+
+      // ── Media serving (public) ────────────────
+      if (path.startsWith('/media/') && (request.method === 'GET' || request.method === 'HEAD')) {
+        if (!env.MEDIA_BUCKET) return new Response('Media bucket not bound', { status: 500 });
+        const key = path.slice('/media/'.length);
+        const obj = await env.MEDIA_BUCKET.get(key);
+        if (!obj) return new Response('Not found', { status: 404 });
+        const headers = new Headers();
+        headers.set('Content-Type', obj.httpMetadata?.contentType || 'application/octet-stream');
+        headers.set('Cache-Control', 'public, max-age=86400');
+        return new Response(obj.body, { status: 200, headers });
+      }
+
+      // ── APK download (public) ─────────────────
+      if (path === '/download/apk' || path.startsWith('/download/apk/')) {
+        if (!env.APK_BUCKET) return new Response('APK bucket not bound', { status: 500 });
+        const filename = path.split('/').pop() || 'signal-dpc-v0.2.1-alpha.apk';
+        const key = (filename === 'download' || filename === 'apk') ? 'signal-dpc-v0.2.1-alpha.apk' : filename;
+        const obj = await env.APK_BUCKET.get(key);
+        if (!obj) return new Response('APK not found: ' + key, { status: 404 });
+        const headers = new Headers();
+        headers.set('Content-Type', 'application/vnd.android.package-archive');
+        headers.set('Content-Length', obj.size.toString());
+        headers.set('Cache-Control', 'public, max-age=3600');
+        headers.set('Content-Disposition', 'attachment; filename="' + key + '"');
+        return new Response(obj.body, { status: 200, headers });
+      }
+
+      // ── Payment page (public) ─────────────────
+      if (path === '/pay' && (request.method === 'GET' || request.method === 'HEAD')) {
+        const imei = url.searchParams.get('imei') || '';
+        const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Signal Electronics — Pay</title>
+<style>
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f6f8; margin: 0; padding: 0; color: #1a1a1a; }
+.header { background: linear-gradient(135deg, #0F62FE 0%, #0a4ed6 100%); color: #fff; padding: 32px 24px 40px; text-align: center; position: relative; overflow: hidden; }
+.header::after { content: ''; position: absolute; bottom: -1px; left: 0; right: 0; height: 40px; background: #f5f6f8; border-radius: 40px 40px 0 0; }
+.header h1 { margin: 0 0 8px; font-size: 26px; }
+.header p { margin: 0; opacity: 0.9; font-size: 14px; }
+.container { max-width: 500px; margin: -20px auto 0; padding: 0 20px 40px; position: relative; z-index: 1; }
+.card { background: #fff; border-radius: 16px; padding: 28px 24px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); margin-bottom: 16px; }
+.label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+.value { font-size: 18px; font-weight: 600; margin-bottom: 20px; }
+.mode-btn { display: block; width: 100%; padding: 18px; margin-bottom: 12px; border: 2px solid #e0e0e0; border-radius: 12px; background: #fff; text-align: left; cursor: pointer; font-family: inherit; font-size: 15px; transition: all 0.15s; }
+.mode-btn:hover { border-color: #0F62FE; }
+.mode-btn.selected { border-color: #0F62FE; background: #f0f6ff; }
+.mode-btn strong { display: block; font-size: 16px; margin-bottom: 4px; color: #0F62FE; }
+.mode-btn span { font-size: 13px; color: #666; }
+.pay-btn { display: block; width: 100%; padding: 18px; border: none; border-radius: 12px; background: #0F62FE; color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; font-family: inherit; }
+.pay-btn:disabled { background: #ccc; cursor: not-allowed; }
+.loader { display: inline-block; width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.footer { text-align: center; font-size: 12px; color: #999; padding: 20px; }
+.summary-line { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f0f0f0; }
+.summary-line:last-child { border-bottom: none; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Signal Electronics</h1>
+  <p>Device Financing Payment</p>
+</div>
+<div class="container">
+  <div class="card">
+    <div class="label">Device</div>
+    <div class="value" style="font-family: monospace; font-size: 14px;">${imei}</div>
+    <div class="label">Outstanding Balance</div>
+    <div class="value" id="outstanding">Loading…</div>
+    <div id="schedule-preview"></div>
+  </div>
+
+  <div class="card">
+    <div class="label">Choose How Much to Pay</div>
+
+    <button class="mode-btn selected" onclick="selectMode('single', this)">
+      <strong>Pay Next Installment</strong>
+      <span id="single-desc">One installment</span>
+    </button>
+
+    <button class="mode-btn" onclick="selectMode('installments', this)">
+      <strong>Pay Several Installments</strong>
+      <span id="multi-desc">Choose how many days/weeks you want to cover</span>
+      <div style="margin-top: 12px; display: none;" id="count-picker">
+        <input type="number" id="count-input" min="1" max="180" value="5"
+          style="width: 100%; padding: 12px; border: 1px solid #e0e0e0; border-radius: 8px; font-size: 15px;"
+          onchange="updateMultiAmount()" onclick="event.stopPropagation()">
+      </div>
+    </button>
+
+    <button class="mode-btn" onclick="selectMode('full', this)">
+      <strong>Pay Full Outstanding Balance</strong>
+      <span id="full-desc">All unpaid installments in one payment</span>
+    </button>
+  </div>
+
+  <div class="card" id="summary-card" style="display: none;">
+    <div class="label">Payment Summary</div>
+    <div id="summary-lines"></div>
+  </div>
+
+  <button class="pay-btn" id="pay-btn" onclick="startPayment()" disabled>
+    Pay Now
+  </button>
+
+  <div class="footer">
+    Powered by Signal Electronics • +256 706 352 822<br>
+    Payments processed securely by Pesapal
+  </div>
+</div>
+
+<script>
+const IMEI = ${JSON.stringify(imei)};
+let currentMode = 'single';
+let schedules = [];
+let multiCount = 5;
+
+async function loadSchedules() {
+  try {
+    const r = await fetch('/public/schedule?imei=' + encodeURIComponent(IMEI));
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+
+    // Fetch detail — need full schedule
+    const r2 = await fetch('/public/schedule?imei=' + encodeURIComponent(IMEI));
+    const data2 = await r2.json();
+    schedules = data2.schedule || [];
+
+    render();
+  } catch (e) {
+    document.getElementById('outstanding').innerText = 'Error: ' + e.message;
+  }
+}
+
+function render() {
+  const unpaid = schedules.filter(s => s.status !== 'paid');
+  if (unpaid.length === 0) {
+    document.getElementById('outstanding').innerText = 'No outstanding balance';
+    document.getElementById('pay-btn').disabled = true;
+    return;
+  }
+
+  const totalOwed = unpaid.reduce((sum, s) => sum + (s.amount_due_ugx - (s.amount_paid_ugx || 0)), 0);
+  document.getElementById('outstanding').innerText = 'UGX ' + Math.round(totalOwed).toLocaleString();
+
+  const next = unpaid[0];
+  const nextAmt = next.amount_due_ugx - (next.amount_paid_ugx || 0);
+  document.getElementById('single-desc').innerText =
+    'Installment ' + next.installment_number + ' — UGX ' + Math.round(nextAmt).toLocaleString();
+
+  document.getElementById('multi-desc').innerText =
+    'Choose how many installments (max ' + unpaid.length + ')';
+
+  document.getElementById('count-input').max = unpaid.length;
+  document.getElementById('full-desc').innerText =
+    'All ' + unpaid.length + ' unpaid installments — UGX ' + Math.round(totalOwed).toLocaleString();
+
+  document.getElementById('pay-btn').disabled = false;
+}
+
+function selectMode(mode, el) {
+  currentMode = mode;
+  document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('selected'));
+  el.classList.add('selected');
+
+  const picker = document.getElementById('count-picker');
+  picker.style.display = mode === 'installments' ? 'block' : 'none';
+
+  updateSummary();
+}
+
+function updateMultiAmount() {
+  multiCount = parseInt(document.getElementById('count-input').value) || 1;
+  updateSummary();
+}
+
+function computeAmount() {
+  const unpaid = schedules.filter(s => s.status !== 'paid');
+  if (currentMode === 'single') {
+    const s = unpaid[0];
+    return { amount: Math.round(s.amount_due_ugx - (s.amount_paid_ugx || 0)), count: 1 };
+  } else if (currentMode === 'installments') {
+    const selected = unpaid.slice(0, Math.max(1, Math.min(multiCount, unpaid.length)));
+    return { amount: Math.round(selected.reduce((sum, s) => sum + (s.amount_due_ugx - (s.amount_paid_ugx || 0)), 0)), count: selected.length };
+  } else {
+    return { amount: Math.round(unpaid.reduce((sum, s) => sum + (s.amount_due_ugx - (s.amount_paid_ugx || 0)), 0)), count: unpaid.length };
+  }
+}
+
+function updateSummary() {
+  const { amount, count } = computeAmount();
+  document.getElementById('summary-card').style.display = 'block';
+  document.getElementById('summary-lines').innerHTML =
+    '<div class="summary-line"><span>Installments covered</span><span>' + count + '</span></div>' +
+    '<div class="summary-line"><span>Amount to pay</span><span>UGX ' + amount.toLocaleString() + '</span></div>';
+}
+
+async function startPayment() {
+  const btn = document.getElementById('pay-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loader"></span> Connecting to Pesapal…';
+
+  const { amount, count } = computeAmount();
+
+  try {
+    const r = await fetch('/public/create-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        device_imei: IMEI,
+        mode: currentMode,
+        installments_count: currentMode === 'installments' ? count : undefined,
+        phone: '',
+        email: 'customer@signalelectronics.ug',
+        first_name: 'Customer',
+        last_name: '',
+      }),
+    });
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+    window.location.href = data.redirect_url;
+  } catch (e) {
+    btn.disabled = false;
+    btn.innerText = 'Pay Now';
+    alert('Payment failed: ' + e.message);
+  }
+}
+
+loadSchedules();
+</script>
+</body></html>`;
+        return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      }
+
+      if (path === '/payment-success' || path === '/pay/payment-success') {
+        return new Response('<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment Successful</title><style>body{font-family:sans-serif;background:#0F62FE;color:#fff;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}.box{background:#fff;color:#1a1a1a;padding:40px 24px;border-radius:16px;text-align:center;max-width:400px;}.check{font-size:72px;margin-bottom:16px;}h1{color:#0F62FE;font-size:24px;margin:0 0 8px;}</style></head><body><div class="box"><div class="check">✅</div><h1>Payment Received</h1><p>Your device will unlock momentarily.</p><p style="font-size:12px;margin-top:24px;">Signal Electronics • +256 706 352 822</p></div></body></html>', { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      }
+
+      if (path === '/api/apk/latest' && request.method === 'GET') {
+        return json({ version: '0.2.1', apk_url: 'https://device-finance-api.whiteghostpheonix.workers.dev/download/apk/signal-dpc-v0.2.1-alpha.apk', released: '2026-10-02' });
+      }
+
+      // ── Public: device registration ───────────
+      if (path === '/api/devices' && request.method === 'POST') {
+        const { imei, customer_name, customer_phone, fcm_token, pending_plan_id, start_date } = await request.json();
+        const reseller = getResellerEmail(request);
+        const existing = await env.DB.prepare(`SELECT imei FROM devices WHERE imei = ?`).bind(imei).first();
+        if (existing) {
+          await env.DB.prepare(`UPDATE devices SET customer_name = COALESCE(?, customer_name), customer_phone = COALESCE(?, customer_phone), fcm_token = COALESCE(?, fcm_token), reseller_email = COALESCE(?, reseller_email) WHERE imei = ?`)
+            .bind(customer_name || null, customer_phone || null, fcm_token || null, reseller || null, imei).run();
+        } else {
+          // Generate a unique payment code
+          let code = generatePaymentCode();
+          let attempts = 0;
+          while (attempts < 5) {
+            const clash = await env.DB.prepare(`SELECT imei FROM devices WHERE payment_code = ?`).bind(code).first();
+            if (!clash) break;
+            code = generatePaymentCode();
+            attempts++;
+          }
+          await env.DB.prepare(`INSERT INTO devices (imei, customer_name, customer_phone, fcm_token, reseller_email, payment_code) VALUES (?, ?, ?, ?, ?, ?)`)
+            .bind(imei, customer_name || 'Unknown', customer_phone || '', fcm_token || null, reseller || null, code).run();
+        }
+        let planAssigned = false;
+        if (pending_plan_id) {
+          const existingSchedule = await env.DB.prepare(`SELECT COUNT(*) as c FROM schedules WHERE device_imei = ?`).bind(imei).first();
+          if (existingSchedule.c === 0) {
+            const plan = await env.DB.prepare(`SELECT * FROM payment_plans WHERE id = ?`).bind(pending_plan_id).first();
+            if (plan) {
+              const installments = await env.DB.prepare(`SELECT * FROM plan_installments WHERE plan_id = ? ORDER BY installment_number`).bind(pending_plan_id).all();
+              if (installments.results?.length) {
+                const start = new Date(start_date || Date.now());
+                const stmts = installments.results.map(inst => {
+                  const dueDate = new Date(start);
+                  dueDate.setDate(dueDate.getDate() + Number(inst.offset_days || 0));
+                  return env.DB.prepare(`INSERT INTO schedules (device_imei, plan_id, installment_number, due_date, amount_due_ugx) VALUES (?, ?, ?, ?, ?)`)
+                    .bind(imei, pending_plan_id, inst.installment_number, dueDate.toISOString().split('T')[0], Number(inst.amount_ugx));
+                });
+                for (let i = 0; i < stmts.length; i += 20) await env.DB.batch(stmts.slice(i, i + 20));
+                planAssigned = true;
+                await logAudit(env, 'device', imei, 'plan_auto_assigned', { plan_id: pending_plan_id, installments: installments.results.length });
+              }
+            }
+          }
+        }
+        await logAudit(env, 'device', imei, 'registered', { customer_name, reseller, planAssigned });
+        return json({ success: true, imei, plan_assigned: planAssigned });
+      }
+
+      // ── Public: FCM token update ──────────────
+      if (path.match(/^\/api\/devices\/[^/]+\/fcm$/) && request.method === 'PUT') {
+        const imei = path.split('/')[3];
+        const { fcm_token } = await request.json().catch(() => ({}));
+        if (!fcm_token) return json({ error: 'fcm_token required' }, 400);
+        await env.DB.prepare(`UPDATE devices SET fcm_token = ? WHERE imei = ?`).bind(fcm_token, imei).run();
+        return json({ success: true });
+      }
+
+      // ── Public: heartbeat ─────────────────────
+      if (path.match(/^\/api\/devices\/[^/]+\/heartbeat$/) && request.method === 'POST') {
+        const imei = path.split('/')[3];
+        const body = await request.json().catch(() => ({}));
+        const device = await env.DB.prepare(`SELECT imei, status, payment_code FROM devices WHERE imei = ?`).bind(imei).first();
+        if (!device) return json({ error: 'Device not registered' }, 404);
+        await logAudit(env, 'device', imei, 'heartbeat', body);
+        const schedules = await env.DB.prepare(
+          `SELECT s.installment_number, s.due_date, s.amount_due_ugx, s.amount_paid_ugx, s.status, (SELECT grace_period_days FROM payment_plans p WHERE p.id = s.plan_id) as grace_days FROM schedules s WHERE s.device_imei = ? ORDER BY s.installment_number`
+        ).bind(imei).all();
+        return json({ success: true, ts: Date.now(), device_status: device.status, payment_code: device.payment_code, schedule: schedules.results || [] });
+      }
+
+      // ── Public: device ack ────────────────────
+      if (path === '/api/device/ack' && request.method === 'POST') {
+        const { command_id } = await request.json().catch(() => ({}));
+        if (!command_id) return json({ error: 'command_id required' }, 400);
+        await env.DB.prepare(`UPDATE commands SET status = 'acknowledged', acknowledged_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(command_id).run();
+        await logAudit(env, 'command', command_id, 'acknowledged', { via: 'device' });
+        return json({ success: true, command_id });
+      }
+
+      // ── Public: device status ─────────────────
+      if (path === '/api/device-status' && (request.method === 'GET' || request.method === 'HEAD')) {
+        const imei = url.searchParams.get('imei');
+        if (!imei) return json({ error: 'imei required' }, 400);
+        const device = await env.DB.prepare(`SELECT imei, status, payment_code FROM devices WHERE imei = ?`).bind(imei).first();
+        if (!device) return json({ error: 'Not found' }, 404);
+        const overdueCount = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`).bind(imei).first();
+        const nextDue = await env.DB.prepare(`SELECT id, due_date, amount_due_ugx, amount_paid_ugx FROM schedules WHERE device_imei = ? AND status IN ('pending','overdue') ORDER BY due_date ASC LIMIT 1`).bind(imei).first();
+        return json({ imei: device.imei, status: device.status, payment_code: device.payment_code, overdue_count: overdueCount.cnt, next_due: nextDue || null });
+      }
+
+      // ═══════════════════════════════════════════
+      // PESAPAL: Create payment order
+      // ═══════════════════════════════════════════
+      if (path === '/api/pesapal/create-order' && request.method === 'POST') {
+        const { device_imei, amount_ugx, mode = 'single', installments_count, phone, email, first_name, last_name } = await request.json();
+        if (!device_imei) return json({ error: 'device_imei required' }, 400);
+
+        const device = await env.DB.prepare(`SELECT imei, customer_name, customer_phone, payment_code FROM devices WHERE imei = ?`).bind(device_imei).first();
+        if (!device) return json({ error: 'Device not found' }, 404);
+
+        // Get all unpaid schedules in order
+        const unpaid = await env.DB.prepare(
+          `SELECT id, installment_number, amount_due_ugx, amount_paid_ugx FROM schedules
+           WHERE device_imei = ? AND status IN ('pending','overdue')
+           ORDER BY installment_number ASC`
+        ).bind(device_imei).all();
+
+        if (!unpaid.results?.length) return json({ error: 'No unpaid schedule' }, 400);
+
+        // Decide which schedules to pay based on mode
+        let schedulesToPay = [];
+        let amountToCharge = 0;
+
+        if (mode === 'single') {
+          const first = unpaid.results[0];
+          const remaining = first.amount_due_ugx - (first.amount_paid_ugx || 0);
+          schedulesToPay = [first];
+          amountToCharge = amount_ugx ? Number(amount_ugx) : remaining;
+        } else if (mode === 'installments') {
+          const count = Math.max(1, Math.min(Number(installments_count) || 1, unpaid.results.length));
+          schedulesToPay = unpaid.results.slice(0, count);
+          amountToCharge = schedulesToPay.reduce((sum, s) => sum + (s.amount_due_ugx - (s.amount_paid_ugx || 0)), 0);
+        } else if (mode === 'full') {
+          schedulesToPay = unpaid.results;
+          amountToCharge = schedulesToPay.reduce((sum, s) => sum + (s.amount_due_ugx - (s.amount_paid_ugx || 0)), 0);
+        } else {
+          return json({ error: 'Invalid mode. Use single, installments, or full' }, 400);
+        }
+
+        // Round to whole UGX
+        amountToCharge = Math.round(amountToCharge);
+        if (amountToCharge < 100) return json({ error: 'Amount too small (min 100 UGX)' }, 400);
+
+        const merchantRef = `SG-${device.payment_code || device.imei.slice(-4)}-${Date.now().toString(36).toUpperCase()}`;
+        const callbackUrl = `${url.origin}/api/pesapal/callback?ref=${merchantRef}`;
+
+        let ipnId = await env.DB.prepare(`SELECT value FROM settings WHERE key = 'pesapal_ipn_id'`).first();
+        ipnId = ipnId?.value;
+
+        if (!ipnId) {
+          const ipnUrl = `${url.origin}/api/webhooks/pesapal`;
+          const registered = await registerIpn(env, ipnUrl, 'POST');
+          ipnId = registered.ipn_id;
+          await env.DB.prepare(`INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('pesapal_ipn_id', ?, CURRENT_TIMESTAMP)`).bind(ipnId).run();
+        }
+
+        const desc = mode === 'single'
+          ? `Installment ${schedulesToPay[0].installment_number} — ${device.customer_name || device_imei}`
+          : `${schedulesToPay.length} installments — ${device.customer_name || device_imei}`;
+
+        const order = await submitOrder(env, {
+          id: merchantRef,
+          amount: amountToCharge,
+          currency: 'UGX',
+          description: desc,
+          callbackUrl,
+          ipnId,
+          phone: phone || device.customer_phone,
+          email,
+          firstName: first_name || device.customer_name || 'Customer',
+          lastName: last_name || '',
+        });
+
+        if (order.error) return json({ error: order.error.message || 'Pesapal order failed' }, 500);
+
+        // Store the multi-schedule mapping as a JSON array in schedule_id (TEXT)
+        // Actually store the first schedule's id in the schedule_id column and the array in a new column
+        await env.DB.prepare(
+          `INSERT INTO payment_orders (order_tracking_id, merchant_reference, device_imei, schedule_id, amount_ugx, redirect_url)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        ).bind(order.order_tracking_id, merchantRef, device_imei, schedulesToPay[0].id, amountToCharge, order.redirect_url).run();
+
+        await logAudit(env, 'payment_order', merchantRef, 'created', {
+          device_imei, mode, schedule_ids: schedulesToPay.map(s => s.id), amount: amountToCharge, tracking_id: order.order_tracking_id,
+        });
+
+        return json({
+          success: true,
+          merchant_reference: merchantRef,
+          order_tracking_id: order.order_tracking_id,
+          redirect_url: order.redirect_url,
+          mode,
+          schedules_count: schedulesToPay.length,
+          amount_ugx: amountToCharge,
+        });
+      }
+
+      // ═══════════════════════════════════════════
+      // PESAPAL: Callback after customer finishes
+      // ═══════════════════════════════════════════
+      if (path === '/api/pesapal/callback' && (request.method === 'GET' || request.method === 'HEAD')) {
+        const trackingId = url.searchParams.get('OrderTrackingId') || url.searchParams.get('pesapal_transaction_tracking_id');
+        const ref = url.searchParams.get('OrderMerchantReference') || url.searchParams.get('ref');
+
+        if (!trackingId && !ref) return json({ error: 'Missing tracking id or reference' }, 400);
+
+        let order = null;
+        if (trackingId) order = await env.DB.prepare(`SELECT * FROM payment_orders WHERE order_tracking_id = ?`).bind(trackingId).first();
+        if (!order && ref) order = await env.DB.prepare(`SELECT * FROM payment_orders WHERE merchant_reference = ?`).bind(ref).first();
+
+        if (!order) return json({ error: 'Order not found' }, 404);
+
+        let status = null;
+        try { status = await getTransactionStatus(env, order.order_tracking_id); }
+        catch (e) { return json({ success: false, error: 'Status check failed: ' + String(e.message || e) }, 500); }
+
+        let processed = { matched: false, reason: 'pending' };
+        if (status.payment_status_description === 'COMPLETED' || status.status_code === 1) {
+          processed = await processIncomingPayment(env, {
+            provider: 'pesapal',
+            provider_tx_id: order.order_tracking_id,
+            amount_ugx: status.amount || order.amount_ugx,
+            currency: status.currency || 'UGX',
+            phone: '',
+            reference: order.merchant_reference,
+            payment_code: order.device_imei,
+            fee_amount: 0,
+            raw_payload: { status, order },
+          });
+        }
+
+        return json({ success: true, status: status.payment_status_description, ...processed });
+      }
+
+      // ═══════════════════════════════════════════
+      // PESAPAL: IPN webhook
+      // ═══════════════════════════════════════════
+      if (path === '/api/webhooks/pesapal' && (request.method === 'POST' || request.method === 'GET')) {
+        let params = {};
+        if (request.method === 'POST') {
+          try { params = await request.json(); } catch (_) {
+            const text = await request.text().catch(() => '');
+            new URLSearchParams(text).forEach((v, k) => { params[k] = v; });
+          }
+        } else {
+          url.searchParams.forEach((v, k) => { params[k] = v; });
+        }
+
+        const trackingId = params.pesapal_transaction_tracking_id || params.OrderTrackingId;
+        const merchantRef = params.pesapal_merchant_reference || params.OrderMerchantReference;
+
+        if (!trackingId && !merchantRef) return json({ status: 200, message: 'ignored' });
+
+        const order = trackingId
+          ? await env.DB.prepare(`SELECT * FROM payment_orders WHERE order_tracking_id = ?`).bind(trackingId).first()
+          : await env.DB.prepare(`SELECT * FROM payment_orders WHERE merchant_reference = ?`).bind(merchantRef).first();
+
+        if (!order) return json({ status: 200, message: 'order not found' });
+
+        let status = null;
+        try { status = await getTransactionStatus(env, order.order_tracking_id); }
+        catch (e) { return json({ status: 500, error: String(e.message || e) }); }
+
+        if (status.payment_status_description === 'COMPLETED' || status.status_code === 1) {
+          await processIncomingPayment(env, {
+            provider: 'pesapal',
+            provider_tx_id: order.order_tracking_id,
+            amount_ugx: status.amount || order.amount_ugx,
+            currency: status.currency || 'UGX',
+            phone: '',
+            reference: order.merchant_reference,
+            payment_code: order.device_imei,
+            fee_amount: 0,
+            raw_payload: { status, order },
+          });
+          await env.DB.prepare(`UPDATE payment_orders SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(order.id).run();
+        }
+
+        return new Response(JSON.stringify({
+          orderNotificationType: 'IPNCHANGE',
+          orderTrackingId: order.order_tracking_id,
+          orderMerchantReference: order.merchant_reference,
+          status: 200,
+        }), { headers: { 'Content-Type': 'application/json' } });
+      }
+
+      // ═══════════════════════════════════════════
+      // PESAPAL: Register IPN (admin)
+      // ═══════════════════════════════════════════
+      if (path === '/api/admin/pesapal/register-ipn' && request.method === 'POST') {
+        const ipnUrl = `${url.origin}/api/webhooks/pesapal`;
+        const result = await registerIpn(env, ipnUrl, 'POST');
+        await env.DB.prepare(
+          `INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('pesapal_ipn_id', ?, CURRENT_TIMESTAMP)`
+        ).bind(result.ipn_id).run();
+        return json({ success: true, ipn_id: result.ipn_id, url: ipnUrl });
+      }
+
+      // ═══════════════════════════════════════════
+      // FLUTTERWAVE WEBHOOK
+      // ═══════════════════════════════════════════
+      if (path === '/api/webhooks/flutterwave' && request.method === 'POST') {
+        // 1. Verify signature
+        const signature = request.headers.get('verif-hash');
+        const expected = env.FLUTTERWAVE_SECRET_HASH;
+
+        if (!expected || !signature || signature !== expected) {
+          await logAudit(env, 'webhook', 'flutterwave', 'invalid_signature', { has_signature: !!signature });
+          return new Response('Unauthorized', { status: 401 });
+        }
+
+        // 2. Parse payload
+        let payload;
+        try {
+          payload = await request.json();
+        } catch (e) {
+          return json({ error: 'Invalid JSON' }, 400);
+        }
+
+        // 3. Only handle charge.completed
+        if (payload.event !== 'charge.completed') {
+          return json({ success: true, ignored: true, event: payload.event });
+        }
+
+        const data = payload.data || {};
+        const status = data.status;
+        if (status !== 'successful' && status !== 'success') {
+          await logAudit(env, 'webhook', 'flutterwave', 'charge_not_successful', { status, tx_ref: data.tx_ref });
+          return json({ success: true, ignored: true, status });
+        }
+
+        // 4. Extract payment details
+        const result = await processIncomingPayment(env, {
+          provider: 'flutterwave',
+          provider_tx_id: String(data.id || data.flw_ref || ''),
+          amount_ugx: Number(data.amount || 0),
+          currency: data.currency,
+          phone: data.customer?.phone_number || '',
+          reference: data.tx_ref || '',
+          payment_code: data.tx_ref || '',
+          fee_amount: Number(data.app_fee || 0),
+          raw_payload: payload,
+        });
+
+        // Flutterwave requires 200 response
+        return json(result);
+      }
+
+      // ═══════════════════════════════════════════
+      // SANDBOX SIMULATOR (for testing without real money)
+      // ═══════════════════════════════════════════
+      if (path === '/api/sandbox/simulate-payment' && request.method === 'POST') {
+        const { device_imei, amount_ugx, reference, phone } = await request.json();
+        if (!amount_ugx) return json({ error: 'amount_ugx required' }, 400);
+
+        const result = await processIncomingPayment(env, {
+          provider: 'sandbox',
+          provider_tx_id: 'SANDBOX_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+          amount_ugx: Number(amount_ugx),
+          currency: 'UGX',
+          phone: phone || '',
+          reference: reference || '',
+          payment_code: reference || '',
+          fee_amount: 0,
+          raw_payload: { simulated: true, device_imei, amount_ugx, reference, phone, ts: Date.now() },
+        });
+
+        return json({ ...result, simulated: true });
+      }
+
+      // ── Admin: dashboard summary ──────────────
+      if (path === '/api/dashboard/summary' && request.method === 'GET') {
+        const reseller = getResellerEmail(request);
+        if (reseller) {
+          const q = (sql) => env.DB.prepare(sql).bind(reseller).first();
+          const [td, ad, ld, od, tc, pc] = await Promise.all([
+            q(`SELECT COUNT(*) as c FROM devices WHERE reseller_email = ?`),
+            q(`SELECT COUNT(*) as c FROM devices WHERE status='active' AND reseller_email = ?`),
+            q(`SELECT COUNT(*) as c FROM devices WHERE status='locked' AND reseller_email = ?`),
+            q(`SELECT COUNT(*) as c FROM schedules WHERE status='overdue' AND device_imei IN (SELECT imei FROM devices WHERE reseller_email = ?)`),
+            q(`SELECT COALESCE(SUM(t.amount_ugx),0) as s FROM transactions t JOIN schedules s ON t.schedule_id = s.id WHERE s.device_imei IN (SELECT imei FROM devices WHERE reseller_email = ?)`),
+            q(`SELECT COUNT(*) as c FROM commands WHERE status='queued' AND device_imei IN (SELECT imei FROM devices WHERE reseller_email = ?)`),
+          ]);
+          return json({ total_devices: td.c, active_devices: ad.c, locked_devices: ld.c, overdue_schedules: od.c, total_collected_ugx: tc.s, pending_commands: pc.c });
+        }
+        const [td, ad, ld, od, tc, pc] = await Promise.all([
+          env.DB.prepare(`SELECT COUNT(*) as c FROM devices`).first(),
+          env.DB.prepare(`SELECT COUNT(*) as c FROM devices WHERE status='active'`).first(),
+          env.DB.prepare(`SELECT COUNT(*) as c FROM devices WHERE status='locked'`).first(),
+          env.DB.prepare(`SELECT COUNT(*) as c FROM schedules WHERE status='overdue'`).first(),
+          env.DB.prepare(`SELECT COALESCE(SUM(amount_ugx),0) as s FROM transactions`).first(),
+          env.DB.prepare(`SELECT COUNT(*) as c FROM commands WHERE status='queued'`).first(),
+        ]);
+        return json({ total_devices: td.c, active_devices: ad.c, locked_devices: ld.c, overdue_schedules: od.c, total_collected_ugx: tc.s, pending_commands: pc.c });
+      }
+
+      if (path === '/api/dashboard/devices' && request.method === 'GET') {
+        const reseller = getResellerEmail(request);
+        const base = `SELECT d.imei, d.customer_name, d.customer_phone, d.status, d.created_at, d.reseller_email, d.payment_code, (SELECT COUNT(*) FROM schedules s WHERE s.device_imei = d.imei AND s.status = 'paid') as paid_count, (SELECT COUNT(*) FROM schedules s WHERE s.device_imei = d.imei) as total_count, (SELECT SUM(s.amount_due_ugx - COALESCE(s.amount_paid_ugx,0)) FROM schedules s WHERE s.device_imei = d.imei AND s.status != 'paid') as balance_ugx, (SELECT s.due_date FROM schedules s WHERE s.device_imei = d.imei AND s.status IN ('pending','overdue') ORDER BY s.due_date ASC LIMIT 1) as next_due_date FROM devices d`;
+        const rows = reseller
+          ? await env.DB.prepare(base + ` WHERE d.reseller_email = ? ORDER BY d.created_at DESC LIMIT 500`).bind(reseller).all()
+          : await env.DB.prepare(base + ` ORDER BY d.created_at DESC LIMIT 500`).all();
+        return json(rows.results);
+      }
+
+      if (path.match(/^\/api\/dashboard\/devices\/[^/]+$/) && request.method === 'GET') {
+        const imei = path.split('/').pop();
+        const device = await env.DB.prepare(`SELECT * FROM devices WHERE imei = ?`).bind(imei).first();
+        if (!device) return json({ error: 'Not found' }, 404);
+        const schedules = await env.DB.prepare(`SELECT * FROM schedules WHERE device_imei = ? ORDER BY installment_number`).bind(imei).all();
+        const transactions = await env.DB.prepare(`SELECT t.* FROM transactions t JOIN schedules s ON t.schedule_id = s.id WHERE s.device_imei = ? ORDER BY t.paid_at DESC LIMIT 50`).bind(imei).all();
+        const commands = await env.DB.prepare(`SELECT * FROM commands WHERE device_imei = ? ORDER BY created_at DESC LIMIT 20`).bind(imei).all();
+        const customer = await env.DB.prepare(`SELECT * FROM customers WHERE imei = ?`).bind(imei).first();
+        const guarantors = await env.DB.prepare(`SELECT * FROM guarantors WHERE customer_imei = ? ORDER BY slot`).bind(imei).all();
+        return json({ device, schedules: schedules.results, transactions: transactions.results, commands: commands.results, customer: customer || null, guarantors: guarantors.results || [] });
+      }
+
+      if (path === '/api/admin/run-overdue-check' && request.method === 'POST') {
+        const result = await detectOverdue(env);
+        return json({ success: true, ...result });
+      }
+
+      if (path === '/api/commands/lock' && request.method === 'POST') {
+        const { imei, reason } = await request.json();
+        if (!imei) return json({ error: 'imei required' }, 400);
+        await env.DB.prepare(`UPDATE devices SET status = 'locked' WHERE imei = ?`).bind(imei).run();
+        const cmd = await queueCommand(env, imei, 'LOCK', reason || 'manual');
+        return json({ success: true, command_id: cmd.id, deduplicated: cmd.deduplicated });
+      }
+      if (path === '/api/commands/unlock' && request.method === 'POST') {
+        const { imei, reason } = await request.json();
+        if (!imei) return json({ error: 'imei required' }, 400);
+        await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(imei).run();
+        const cmd = await queueCommand(env, imei, 'UNLOCK', reason || 'manual');
+        return json({ success: true, command_id: cmd.id, deduplicated: cmd.deduplicated });
+      }
+
+      if (path === '/api/commands' && request.method === 'GET') {
+        const status = url.searchParams.get('status');
+        const q = status
+          ? env.DB.prepare(`SELECT * FROM commands WHERE status = ? ORDER BY created_at DESC LIMIT 100`).bind(status)
+          : env.DB.prepare(`SELECT * FROM commands ORDER BY created_at DESC LIMIT 100`);
+        return json((await q.all()).results);
+      }
+
+      if (path === '/api/admin/test-push' && request.method === 'POST') {
+        const { fcm_token, action, reason } = await request.json();
+        if (!fcm_token) return json({ error: 'fcm_token required' }, 400);
+        try {
+          const resp = await sendFcm(env, fcm_token, { action: action || 'TEST', reason: reason || 'manual_test', ts: Date.now() });
+          return json({ success: true, fcm_response: resp });
+        } catch (err) { return json({ success: false, error: String(err.message || err) }, 500); }
+      }
+
+      if (path === '/api/admin/dispatch-queue' && request.method === 'POST') {
+        const result = await dispatchPendingCommands(env, 100);
+        return json({ success: true, ...result });
+      }
+
+      if (path === '/api/payments' && request.method === 'POST') {
+        const { schedule_id, amount_ugx, payment_method, reference } = await request.json();
+        if (!schedule_id || !amount_ugx) return json({ error: 'schedule_id and amount_ugx required' }, 400);
+        const schedule = await env.DB.prepare(`SELECT * FROM schedules WHERE id = ?`).bind(schedule_id).first();
+        if (!schedule) return json({ error: 'Schedule not found' }, 404);
+        const newPaid = (schedule.amount_paid_ugx || 0) + Number(amount_ugx);
+        const newStatus = newPaid >= schedule.amount_due_ugx ? 'paid' : schedule.status;
+        await env.DB.prepare(`UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?`).bind(newPaid, newStatus, schedule_id).run();
+        await env.DB.prepare(`INSERT INTO transactions (schedule_id, amount_ugx, payment_method, reference) VALUES (?, ?, ?, ?)`).bind(schedule_id, amount_ugx, payment_method || 'unknown', reference || null).run();
+        await logAudit(env, 'schedule', schedule_id, 'payment_recorded', { amount_ugx, payment_method, reference });
+        const overdueLeft = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM schedules WHERE device_imei = ? AND status = 'overdue'`).bind(schedule.device_imei).first();
+        let unlocked = false;
+        if (overdueLeft.cnt === 0) {
+          await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(schedule.device_imei).run();
+          await queueCommand(env, schedule.device_imei, 'UNLOCK', 'overdue_cleared');
+          unlocked = true;
+        }
+        return json({ success: true, schedule_status: newStatus, device_unlocked: unlocked, overdue_remaining: overdueLeft.cnt });
+      }
+
+      if (path === '/api/audit' && request.method === 'GET') {
+        const limit = Number(url.searchParams.get('limit') || 100);
+        const rows = await env.DB.prepare(`SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?`).bind(limit).all();
+        return json(rows.results);
+      }
+
+      if (path === '/api/payment-matches' && request.method === 'GET') {
+        const limit = Number(url.searchParams.get('limit') || 50);
+        const rows = await env.DB.prepare(
+          `SELECT pm.*, d.customer_name FROM payment_matches pm
+           LEFT JOIN devices d ON pm.device_imei = d.imei
+           ORDER BY pm.created_at DESC LIMIT ?`
+        ).bind(limit).all();
+        return json(rows.results);
+      }
+
+      if (path === '/api/webhook-events' && request.method === 'GET') {
+        const limit = Number(url.searchParams.get('limit') || 50);
+        const rows = await env.DB.prepare(`SELECT id, provider, event_id, event_type, processed_at FROM webhook_events ORDER BY id DESC LIMIT ?`).bind(limit).all();
+        return json(rows.results);
+      }
+
+      // ═══════════════════════════════════════════
+      // PLANS
+      // ═══════════════════════════════════════════
+      if (path === '/api/plans' && request.method === 'POST') {
+        const body = await request.json();
+        const { plan_name, grace_period_days, frequency, amount_per_period, period_count, has_deposit, deposit_amount, deposit_due_days, notes } = body;
+        if (!plan_name) return json({ error: 'plan_name required' }, 400);
+        if (!amount_per_period || !period_count || !frequency) return json({ error: 'amount_per_period, period_count, and frequency required' }, 400);
+        const count = Number(period_count);
+        if (count < 1 || count > 2000) return json({ error: 'period_count must be 1-2000' }, 400);
+        const amount = Number(amount_per_period);
+        const deposit = has_deposit ? Number(deposit_amount || 0) : 0;
+        const total = amount * count + deposit;
+        const stepDays = frequency === 'daily' ? 1 : frequency === 'weekly' ? 7 : 30;
+        const result = await env.DB.prepare(
+          `INSERT INTO payment_plans (plan_name, total_amount_ugx, installment_count, grace_period_days, frequency, notes, amount_per_period, period_type, period_count, has_deposit, deposit_amount, deposit_due_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(plan_name, total, count, grace_period_days || 3, frequency, notes || null, amount, frequency, count, has_deposit ? 1 : 0, deposit, has_deposit ? (deposit_due_days || 0) : 0).run();
+        const planId = result.meta.last_row_id;
+        const allInstallments = [];
+        if (has_deposit && deposit > 0) allInstallments.push({ offset_days: Number(deposit_due_days || 0), amount_ugx: deposit, label: 'Deposit' });
+        for (let i = 0; i < count; i++) {
+          const offset = (has_deposit ? Number(deposit_due_days || 0) : 0) + (i + 1) * stepDays;
+          allInstallments.push({ offset_days: offset, amount_ugx: amount, label: `${frequency}_${i + 1}` });
+        }
+        for (let i = 0; i < allInstallments.length; i += 20) {
+          const chunk = allInstallments.slice(i, i + 20);
+          const stmts = chunk.map((inst, idx) => env.DB.prepare(
+            `INSERT INTO plan_installments (plan_id, installment_number, offset_days, amount_ugx, label) VALUES (?, ?, ?, ?, ?)`
+          ).bind(planId, i + idx + 1, inst.offset_days, inst.amount_ugx, inst.label));
+          await env.DB.batch(stmts);
+        }
+        await logAudit(env, 'plan', planId, 'created', { plan_name, frequency, period_count: count, amount, total });
+        return json({ success: true, plan_id: planId, total, period_count: count, amount_per_period: amount, deposit });
+      }
+
+      if (path === '/api/plans' && request.method === 'GET') {
+        const rows = await env.DB.prepare(`SELECT * FROM payment_plans ORDER BY created_at DESC`).all();
+        return json(rows.results);
+      }
+
+      if (path.match(/^\/api\/plans\/\d+$/) && request.method === 'GET') {
+        const id = Number(path.split('/').pop());
+        const plan = await env.DB.prepare(`SELECT * FROM payment_plans WHERE id = ?`).bind(id).first();
+        if (!plan) return json({ error: 'Not found' }, 404);
+        const installments = await env.DB.prepare(`SELECT * FROM plan_installments WHERE plan_id = ? ORDER BY installment_number`).bind(id).all();
+        return json({ ...plan, installments: installments.results || [] });
+      }
+
+      if (path.match(/^\/api\/plans\/\d+$/) && request.method === 'PUT') {
+        const id = Number(path.split('/').pop());
+        const body = await request.json();
+        const plan = await env.DB.prepare(`SELECT * FROM payment_plans WHERE id = ?`).bind(id).first();
+        if (!plan) return json({ error: 'Not found' }, 404);
+        await env.DB.prepare(`UPDATE payment_plans SET plan_name=?, grace_period_days=?, notes=? WHERE id=?`)
+          .bind(body.plan_name || plan.plan_name, body.grace_period_days ?? plan.grace_period_days, body.notes ?? plan.notes, id).run();
+        return json({ success: true, plan_id: id });
+      }
+
+      if (path === '/api/assign-plan' && request.method === 'POST') {
+        const { imei, plan_id, start_date } = await request.json();
+        const plan = await env.DB.prepare(`SELECT * FROM payment_plans WHERE id = ?`).bind(plan_id).first();
+        if (!plan) return json({ error: 'Plan not found' }, 404);
+        const installments = await env.DB.prepare(`SELECT * FROM plan_installments WHERE plan_id = ? ORDER BY installment_number`).bind(plan_id).all();
+        if (!installments.results?.length) return json({ error: 'Plan has no installments' }, 400);
+        const start = new Date(start_date || Date.now());
+        const stmts = installments.results.map(inst => {
+          const dueDate = new Date(start);
+          dueDate.setDate(dueDate.getDate() + Number(inst.offset_days || 0));
+          return env.DB.prepare(`INSERT INTO schedules (device_imei, plan_id, installment_number, due_date, amount_due_ugx) VALUES (?, ?, ?, ?, ?)`)
+            .bind(imei, plan_id, inst.installment_number, dueDate.toISOString().split('T')[0], Number(inst.amount_ugx));
+        });
+        for (let i = 0; i < stmts.length; i += 20) await env.DB.batch(stmts.slice(i, i + 20));
+        await logAudit(env, 'device', imei, 'plan_assigned', { plan_id, installments: installments.results.length });
+        return json({ success: true, installments_created: installments.results.length, total: plan.total_amount_ugx });
+      }
+
+      // ═══════════════════════════════════════════
+      // CUSTOMERS
+      // ═══════════════════════════════════════════
+      if (path === '/api/customers' && request.method === 'POST') {
+        const body = await request.json();
+        const { imei, full_name, phone, nin, dob, address, occupation, monthly_income, photo_base64, photo_with_reseller_base64, device_photo_base64, id_front_base64, id_back_base64 } = body;
+        if (!imei || !full_name) return json({ error: 'imei and full_name required' }, 400);
+        const ninCheck = validateUgandaNIN(nin);
+        if (!ninCheck.valid) return json({ error: ninCheck.reason, kyc_status: 'rejected' }, 400);
+        const dup = await env.DB.prepare(`SELECT imei FROM customers WHERE nin = ? AND imei != ?`).bind(ninCheck.normalized, imei).first();
+        if (dup) return json({ error: 'This NIN is already registered to another device', kyc_status: 'rejected' }, 400);
+        const dupR = await env.DB.prepare(`SELECT email FROM resellers WHERE nin = ?`).bind(ninCheck.normalized).first();
+        if (dupR) return json({ error: 'This NIN belongs to a reseller', kyc_status: 'rejected' }, 400);
+        const dupG = await env.DB.prepare(`SELECT customer_imei FROM guarantors WHERE nin = ?`).bind(ninCheck.normalized).first();
+        if (dupG) return json({ error: 'This NIN is registered as a guarantor', kyc_status: 'rejected' }, 400);
+
+        const photoUrl = photo_base64 ? await saveImageToR2(env, `customers/${imei}/photo.jpg`, photo_base64, 'image/jpeg') : null;
+        const withResellerUrl = photo_with_reseller_base64 ? await saveImageToR2(env, `customers/${imei}/with-reseller.jpg`, photo_with_reseller_base64, 'image/jpeg') : null;
+        const devicePhotoUrl = device_photo_base64 ? await saveImageToR2(env, `customers/${imei}/device.jpg`, device_photo_base64, 'image/jpeg') : null;
+        const idFrontUrl = id_front_base64 ? await saveImageToR2(env, `customers/${imei}/id-front.jpg`, id_front_base64, 'image/jpeg') : null;
+        const idBackUrl = id_back_base64 ? await saveImageToR2(env, `customers/${imei}/id-back.jpg`, id_back_base64, 'image/jpeg') : null;
+
+        const existing = await env.DB.prepare(`SELECT id FROM customers WHERE imei = ?`).bind(imei).first();
+        if (existing) {
+          await env.DB.prepare(`UPDATE customers SET full_name=?, phone=?, nin=?, dob=?, address=?, occupation=?, monthly_income=?, photo_url=COALESCE(?, photo_url), photo_with_reseller_url=COALESCE(?, photo_with_reseller_url), device_photo_url=COALESCE(?, device_photo_url), id_front_url=COALESCE(?, id_front_url), id_back_url=COALESCE(?, id_back_url), nin_verified=1, kyc_status='verified', updated_at=CURRENT_TIMESTAMP WHERE imei=?`)
+            .bind(full_name, phone || null, ninCheck.normalized, dob || null, address || null, occupation || null, monthly_income || null, photoUrl, withResellerUrl, devicePhotoUrl, idFrontUrl, idBackUrl, imei).run();
+        } else {
+          await env.DB.prepare(`INSERT INTO customers (imei, full_name, phone, nin, dob, address, occupation, monthly_income, photo_url, photo_with_reseller_url, device_photo_url, id_front_url, id_back_url, nin_verified, kyc_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'verified')`)
+            .bind(imei, full_name, phone || null, ninCheck.normalized, dob || null, address || null, occupation || null, monthly_income || null, photoUrl, withResellerUrl, devicePhotoUrl, idFrontUrl, idBackUrl).run();
+        }
+        await logAudit(env, 'customer', imei, 'kyc_saved', { full_name, nin: ninCheck.normalized });
+        return json({ success: true, imei, nin_verified: true, kyc_status: 'verified' });
+      }
+
+      if (path.match(/^\/api\/customers\/[^/]+$/) && request.method === 'GET') {
+        const imei = path.split('/')[3];
+        const customer = await env.DB.prepare(`SELECT * FROM customers WHERE imei = ?`).bind(imei).first();
+        const guarantors = await env.DB.prepare(`SELECT * FROM guarantors WHERE customer_imei = ? ORDER BY slot`).bind(imei).all();
+        return json({ customer: customer || null, guarantors: guarantors.results || [] });
+      }
+
+      if (path.match(/^\/api\/customers\/[^/]+\/guarantors$/) && request.method === 'POST') {
+        const imei = path.split('/')[3];
+        const body = await request.json();
+        const { slot, full_name, phone, nin, relationship, address, occupation, photo_base64, id_front_base64 } = body;
+        if (!slot || slot < 1 || slot > 2) return json({ error: 'slot must be 1 or 2' }, 400);
+        let ninNorm = null;
+        if (nin && nin.trim()) {
+          const c = validateUgandaNIN(nin);
+          if (!c.valid) return json({ error: `Guarantor ${slot}: ${c.reason}` }, 400);
+          ninNorm = c.normalized;
+          const dC = await env.DB.prepare(`SELECT imei FROM customers WHERE nin = ?`).bind(ninNorm).first();
+          if (dC && dC.imei !== imei) return json({ error: `Guarantor ${slot}: NIN already used` }, 400);
+          const dR = await env.DB.prepare(`SELECT email FROM resellers WHERE nin = ?`).bind(ninNorm).first();
+          if (dR) return json({ error: `Guarantor ${slot}: NIN belongs to reseller` }, 400);
+          const dG = await env.DB.prepare(`SELECT customer_imei FROM guarantors WHERE nin = ? AND NOT (customer_imei = ? AND slot = ?)`).bind(ninNorm, imei, slot).first();
+          if (dG) return json({ error: `Guarantor ${slot}: NIN already registered` }, 400);
+        }
+        const photoUrl = photo_base64 ? await saveImageToR2(env, `customers/${imei}/guarantor-${slot}.jpg`, photo_base64, 'image/jpeg') : null;
+        const idFrontUrl = id_front_base64 ? await saveImageToR2(env, `customers/${imei}/guarantor-${slot}-id.jpg`, id_front_base64, 'image/jpeg') : null;
+        const existing = await env.DB.prepare(`SELECT id FROM guarantors WHERE customer_imei = ? AND slot = ?`).bind(imei, slot).first();
+        if (existing) {
+          await env.DB.prepare(`UPDATE guarantors SET full_name=?, phone=?, nin=?, relationship=?, address=?, occupation=?, photo_url=COALESCE(?, photo_url), id_front_url=COALESCE(?, id_front_url), updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+            .bind(full_name || null, phone || null, ninNorm, relationship || null, address || null, occupation || null, photoUrl, idFrontUrl, existing.id).run();
+        } else {
+          await env.DB.prepare(`INSERT INTO guarantors (customer_imei, slot, full_name, phone, nin, relationship, address, occupation, photo_url, id_front_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .bind(imei, slot, full_name || null, phone || null, ninNorm, relationship || null, address || null, occupation || null, photoUrl, idFrontUrl).run();
+        }
+        await logAudit(env, 'guarantor', imei, 'saved', { slot, full_name, nin: ninNorm });
+        return json({ success: true, imei, slot });
+      }
+
+      // ═══════════════════════════════════════════
+      // RESELLERS
+      // ═══════════════════════════════════════════
+      if (path === '/api/resellers' && request.method === 'POST') {
+        const body = await request.json();
+        const { email, name, phone, region, address, nin, occupation, photo_base64, id_front_base64, id_back_base64 } = body;
+        if (!email) return json({ error: 'email required' }, 400);
+        let ninNorm = null;
+        if (nin && nin.trim()) {
+          const c = validateUgandaNIN(nin);
+          if (!c.valid) return json({ error: c.reason }, 400);
+          ninNorm = c.normalized;
+          const d = await env.DB.prepare(`SELECT email FROM resellers WHERE nin = ? AND email != ?`).bind(ninNorm, email).first();
+          if (d) return json({ error: 'NIN already registered to another reseller' }, 400);
+          const dC = await env.DB.prepare(`SELECT imei FROM customers WHERE nin = ?`).bind(ninNorm).first();
+          if (dC) return json({ error: 'NIN already used as customer' }, 400);
+          const dG = await env.DB.prepare(`SELECT customer_imei FROM guarantors WHERE nin = ?`).bind(ninNorm).first();
+          if (dG) return json({ error: 'NIN already used as guarantor' }, 400);
+        }
+        const safeEmail = email.replace(/[^a-z0-9]/gi, '_');
+        const photoUrl = photo_base64 ? await saveImageToR2(env, `resellers/${safeEmail}/photo.jpg`, photo_base64, 'image/jpeg') : null;
+        const idFrontUrl = id_front_base64 ? await saveImageToR2(env, `resellers/${safeEmail}/id-front.jpg`, id_front_base64, 'image/jpeg') : null;
+        const idBackUrl = id_back_base64 ? await saveImageToR2(env, `resellers/${safeEmail}/id-back.jpg`, id_back_base64, 'image/jpeg') : null;
+        const existing = await env.DB.prepare(`SELECT email FROM resellers WHERE email = ?`).bind(email).first();
+        if (existing) {
+          await env.DB.prepare(`UPDATE resellers SET name=?, phone=?, region=?, address=?, nin=?, occupation=?, photo_url=COALESCE(?, photo_url), id_front_url=COALESCE(?, id_front_url), id_back_url=COALESCE(?, id_back_url), nin_verified=1, updated_at=CURRENT_TIMESTAMP WHERE email=?`)
+            .bind(name || null, phone || null, region || null, address || null, ninNorm, occupation || null, photoUrl, idFrontUrl, idBackUrl, email).run();
+        } else {
+          await env.DB.prepare(`INSERT INTO resellers (email, name, phone, region, address, nin, occupation, photo_url, id_front_url, id_back_url, nin_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`)
+            .bind(email, name || null, phone || null, region || null, address || null, ninNorm, occupation || null, photoUrl, idFrontUrl, idBackUrl).run();
+        }
+        await logAudit(env, 'reseller', email, 'kyc_saved', { name, nin: ninNorm });
+        return json({ success: true, email, nin_verified: true });
+      }
+
+      if (path === '/api/resellers' && request.method === 'GET') {
+        const rows = await env.DB.prepare(`SELECT * FROM resellers ORDER BY created_at DESC`).all();
+        return json(rows.results || []);
+      }
+
+      if (path.match(/^\/api\/resellers\/[^/]+$/) && request.method === 'GET') {
+        const email = decodeURIComponent(path.split('/')[3]);
+        const row = await env.DB.prepare(`SELECT * FROM resellers WHERE email = ?`).bind(email).first();
+        return json(row || null);
+      }
+
+      if (path === '/api/validate-nin' && request.method === 'POST') {
+        const { nin } = await request.json();
+        const c = validateUgandaNIN(nin);
+        if (!c.valid) return json({ valid: false, reason: c.reason });
+        const dC = await env.DB.prepare(`SELECT imei FROM customers WHERE nin = ?`).bind(c.normalized).first();
+        const dR = await env.DB.prepare(`SELECT email FROM resellers WHERE nin = ?`).bind(c.normalized).first();
+        const dG = await env.DB.prepare(`SELECT customer_imei FROM guarantors WHERE nin = ?`).bind(c.normalized).first();
+        if (dC || dR || dG) return json({ valid: false, reason: 'NIN already registered' });
+        return json({ valid: true, normalized: c.normalized });
+      }
+
+      if (path.match(/^\/api\/devices\/[^/]+\/qr$/) && request.method === 'GET') {
+        const imei = path.split('/')[3];
+        const APK_KEY = 'signal-dpc-v0.2.1-alpha.apk';
+        const APK_URL = 'https://device-finance-api.whiteghostpheonix.workers.dev/download/apk/' + APK_KEY;
+        const COMPONENT = 'ug.co.signalelectronics.devicefinance/.SignalDeviceAdminReceiver';
+        let checksumB64 = '';
+        try {
+          const apk = await env.APK_BUCKET.get(APK_KEY);
+          if (apk) {
+            const bytes = await apk.arrayBuffer();
+            const hashBuf = await crypto.subtle.digest('SHA-256', bytes);
+            checksumB64 = btoa(String.fromCharCode(...new Uint8Array(hashBuf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+          }
+        } catch (e) { return json({ error: 'R2 read failed' }, 500); }
+        if (!checksumB64) return json({ error: 'APK not in R2' }, 404);
+        const payload = {
+          'android.app.extra.PROVISIONING_DEVICE_ADMIN_COMPONENT_NAME': COMPONENT,
+          'android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_DOWNLOAD_LOCATION': APK_URL,
+          'android.app.extra.PROVISIONING_DEVICE_ADMIN_PACKAGE_CHECKSUM': checksumB64,
+          'android.app.extra.PROVISIONING_LEAVE_ALL_SYSTEM_APPS_ENABLED': true,
+          'android.app.extra.PROVISIONING_SKIP_ENCRYPTION': true,
+          'android.app.extra.PROVISIONING_SKIP_USER_SETUP': true,
+          'android.app.extra.PROVISIONING_ADMIN_EXTRAS_BUNDLE': { server_url: 'https://device-finance-api.whiteghostpheonix.workers.dev' },
+        };
+        return json({ imei, payload, payload_json: JSON.stringify(payload) });
+      }
+
+      return json({ error: 'Not found', path }, 404);
+    } catch (error) {
+      const msg = error?.message || error?.toString?.() || 'Unknown server error';
+      console.error('Worker error:', msg, error?.stack);
+      return json({ error: msg, stack: error?.stack || '' }, 500);
+    }
+  },
+
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil((async () => {
+      const result = await detectOverdue(env);
+      await logAudit(env, 'system', 'cron', 'overdue_check', result);
+      console.log('Cron overdue check:', JSON.stringify(result));
+    })());
+  },
+};
