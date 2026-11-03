@@ -1,19 +1,23 @@
 {
-  "name": "device-finance-api",
-  "version": "1.0.0",
+  "name": "signal-dashboard",
   "private": true,
+  "version": "1.0.0",
+  "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "dev": "vite",
+    "build": "vite build",
+    "build:worker": "npm run build && node build-worker.mjs",
+    "deploy": "npm run build:worker && npx wrangler deploy"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.2",
     "wrangler": "^4.0.0"
   },
-  "trustedDependencies": [
-    "esbuild",
-    "workerd"
-  ],
-  "dependencies": {
-    "rohopay-sdk": "^1.1.3"
-  }
+  "trustedDependencies": ["esbuild", "workerd"]
 }

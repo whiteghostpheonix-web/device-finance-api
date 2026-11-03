@@ -27,12 +27,11 @@ function randomBytes(length) {
 }
 
 function randomOtp() {
-  const n = new DataView(randomBytes(4).buffer).getUint32(0) % 1000000;
-  return String(n).padStart(6, '0');
+  return String(new DataView(randomBytes(4).buffer).getUint32(0) % 1000000).padStart(6, '0');
 }
 
 function randomToken() {
-  return [...randomBytes(32)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return [...randomBytes(32)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 async function otpDigest(env, email, otp) {
@@ -45,7 +44,9 @@ async function readJson(request) {
 }
 
 function response(data, status, requestOrigin) {
-  const origin = ALLOWED_ORIGINS.has(requestOrigin) ? requestOrigin : 'https://signal-dashboard.whiteghostpheonix.workers.dev';
+  const origin = ALLOWED_ORIGINS.has(requestOrigin)
+    ? requestOrigin
+    : 'https://signal-dashboard.whiteghostpheonix.workers.dev';
   return Response.json(data, {
     status,
     headers: {
@@ -60,41 +61,33 @@ function response(data, status, requestOrigin) {
 }
 
 export async function ensureAdminTables(env) {
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS admins (
-      id TEXT PRIMARY KEY,
-      email TEXT NOT NULL UNIQUE,
-      display_name TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run();
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS admin_otp_challenges (
-      id TEXT PRIMARY KEY,
-      admin_id TEXT NOT NULL,
-      otp_hash TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      consumed_at TEXT,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (admin_id) REFERENCES admins(id)
-    )
-  `).run();
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS admin_sessions (
-      token_hash TEXT PRIMARY KEY,
-      admin_id TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      revoked_at TEXT,
-      FOREIGN KEY (admin_id) REFERENCES admins(id)
-    )
-  `).run();
-  await env.DB.prepare(`
-    INSERT OR IGNORE INTO admins (id, email, display_name, active)
-    VALUES ('primary-admin', ?, 'Primary Admin', 1)
-  `).bind(INITIAL_ADMIN_EMAIL).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS admins (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS admin_otp_challenges (
+    id TEXT PRIMARY KEY,
+    admin_id TEXT NOT NULL,
+    otp_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (admin_id) REFERENCES admins(id)
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    admin_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TEXT,
+    FOREIGN KEY (admin_id) REFERENCES admins(id)
+  )`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO admins (id, email, display_name, active)
+    VALUES ('primary-admin', ?, 'Primary Admin', 1)`).bind(INITIAL_ADMIN_EMAIL).run();
 }
 
 export async function getRequestAdmin(request, env) {
@@ -102,15 +95,12 @@ export async function getRequestAdmin(request, env) {
   if (!authorization.startsWith('Bearer ')) return null;
   const token = authorization.slice(7).trim();
   if (!/^[a-f0-9]{64}$/.test(token)) return null;
-  const tokenHash = await sha256(token);
   return env.DB.prepare(`
     SELECT a.id, a.email, a.display_name
-    FROM admin_sessions s
-    JOIN admins a ON a.id = s.admin_id
+    FROM admin_sessions s JOIN admins a ON a.id = s.admin_id
     WHERE s.token_hash = ? AND s.expires_at > datetime('now')
-      AND s.revoked_at IS NULL AND a.active = 1
-    LIMIT 1
-  `).bind(tokenHash).first();
+      AND s.revoked_at IS NULL AND a.active = 1 LIMIT 1
+  `).bind(await sha256(token)).first();
 }
 
 export function isAdminProtectedPath(path, method) {
@@ -149,31 +139,25 @@ export async function handleAdminRoute(request, env) {
   const path = new URL(request.url).pathname;
 
   if (path === '/api/admin/request-otp' && request.method === 'POST') {
-    const body = await readJson(request);
-    const email = normalizeEmail(body.email);
+    const { email: rawEmail } = await readJson(request);
+    const email = normalizeEmail(rawEmail);
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return response({ error: 'Enter a valid admin email address' }, 400, origin);
     }
-
     try {
       const admin = await env.DB.prepare('SELECT id FROM admins WHERE email = ? AND active = 1').bind(email).first();
-      // Do not reveal whether an email is registered as an admin.
+      // Same response for registered and unregistered addresses prevents account enumeration.
       if (!admin) return response({ ok: true, message: 'If this address is authorized, a sign-in code will be sent.' }, 200, origin);
-
-      const recent = await env.DB.prepare(`
-        SELECT COUNT(*) AS count FROM admin_otp_challenges
-        WHERE admin_id = ? AND created_at > datetime('now', '-15 minutes')
-      `).bind(admin.id).first();
+      const recent = await env.DB.prepare(`SELECT COUNT(*) AS count FROM admin_otp_challenges
+        WHERE admin_id = ? AND created_at > datetime('now', '-15 minutes')`).bind(admin.id).first();
       if (Number(recent?.count || 0) >= 3) {
         return response({ error: 'Too many codes requested. Wait 15 minutes and try again.' }, 429, origin);
       }
-
       const otp = randomOtp();
       const digest = await otpDigest(env, email, otp);
-      await env.DB.prepare(`
-        INSERT INTO admin_otp_challenges (id, admin_id, otp_hash, expires_at)
-        VALUES (?, ?, ?, datetime('now', '+${OTP_TTL_MINUTES} minutes'))
-      `).bind(crypto.randomUUID(), admin.id, digest).run();
+      await env.DB.prepare(`INSERT INTO admin_otp_challenges (id, admin_id, otp_hash, expires_at)
+        VALUES (?, ?, ?, datetime('now', '+${OTP_TTL_MINUTES} minutes'))`)
+        .bind(crypto.randomUUID(), admin.id, digest).run();
       await sendOtp(env, email, otp);
       return response({ ok: true, message: 'If this address is authorized, a sign-in code will be sent.' }, 200, origin);
     } catch (error) {
@@ -189,50 +173,41 @@ export async function handleAdminRoute(request, env) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp)) {
       return response({ error: 'Invalid or expired code' }, 401, origin);
     }
-
     const admin = await env.DB.prepare('SELECT id, email, display_name FROM admins WHERE email = ? AND active = 1').bind(email).first();
     if (!admin) return response({ error: 'Invalid or expired code' }, 401, origin);
-    const challenge = await env.DB.prepare(`
-      SELECT id, otp_hash, attempts FROM admin_otp_challenges
+    const challenge = await env.DB.prepare(`SELECT id, otp_hash, attempts FROM admin_otp_challenges
       WHERE admin_id = ? AND consumed_at IS NULL AND expires_at > datetime('now')
-      ORDER BY created_at DESC LIMIT 1
-    `).bind(admin.id).first();
+      ORDER BY created_at DESC LIMIT 1`).bind(admin.id).first();
     if (!challenge || Number(challenge.attempts) >= 5) return response({ error: 'Invalid or expired code' }, 401, origin);
-
-    const digest = await otpDigest(env, email, otp);
-    if (digest !== challenge.otp_hash) {
+    if (await otpDigest(env, email, otp) !== challenge.otp_hash) {
       await env.DB.prepare('UPDATE admin_otp_challenges SET attempts = attempts + 1 WHERE id = ?').bind(challenge.id).run();
       return response({ error: 'Invalid or expired code' }, 401, origin);
     }
-
-    await env.DB.prepare('UPDATE admin_otp_challenges SET consumed_at = datetime(\'now\') WHERE id = ?').bind(challenge.id).run();
+    await env.DB.prepare("UPDATE admin_otp_challenges SET consumed_at = datetime('now') WHERE id = ?").bind(challenge.id).run();
     const token = randomToken();
-    await env.DB.prepare(`
-      INSERT INTO admin_sessions (token_hash, admin_id, expires_at)
-      VALUES (?, ?, datetime('now', '+${SESSION_TTL_HOURS} hours'))
-    `).bind(await sha256(token), admin.id).run();
+    await env.DB.prepare(`INSERT INTO admin_sessions (token_hash, admin_id, expires_at)
+      VALUES (?, ?, datetime('now', '+${SESSION_TTL_HOURS} hours'))`).bind(await sha256(token), admin.id).run();
     return response({ ok: true, token, admin }, 200, origin);
   }
 
   if (path === '/api/admin/me' && request.method === 'GET') {
     const admin = await getRequestAdmin(request, env);
-    if (!admin) return response({ error: 'Unauthorized' }, 401, origin);
-    return response({ admin }, 200, origin);
+    return admin ? response({ admin }, 200, origin) : response({ error: 'Unauthorized' }, 401, origin);
   }
 
   if (path === '/api/admin/logout' && request.method === 'POST') {
     const authorization = request.headers.get('Authorization') || '';
     const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
     if (/^[a-f0-9]{64}$/.test(token)) {
-      await env.DB.prepare('UPDATE admin_sessions SET revoked_at = datetime(\'now\') WHERE token_hash = ?').bind(await sha256(token)).run();
+      await env.DB.prepare("UPDATE admin_sessions SET revoked_at = datetime('now') WHERE token_hash = ?").bind(await sha256(token)).run();
     }
     return response({ ok: true }, 200, origin);
   }
 
   if (path === '/api/admin/users' && request.method === 'GET') {
     if (!await getRequestAdmin(request, env)) return response({ error: 'Unauthorized' }, 401, origin);
-    const rows = await env.DB.prepare('SELECT id, email, display_name, active, created_at FROM admins ORDER BY created_at').all();
-    return response({ users: rows.results || [] }, 200, origin);
+    const result = await env.DB.prepare('SELECT id, email, display_name, active, created_at FROM admins ORDER BY created_at').all();
+    return response({ users: result.results || [] }, 200, origin);
   }
 
   if (path === '/api/admin/users' && request.method === 'POST') {
