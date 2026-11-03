@@ -127,14 +127,15 @@ export function isAdminProtectedPath(path, method) {
 
 async function sendOtp(env, email, otp) {
   if (!env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not configured');
-  if (!env.RESEND_FROM) throw new Error('RESEND_FROM is not configured');
   const result = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      from: env.RESEND_FROM,
-      to: [email],
+      // Match the sender used by the supplied working Resend example.
+      from: 'Signal <onboarding@resend.dev>',
+      to: email,
       subject: 'Your Signal admin sign-in code',
+      html: `<h1 style="color:#2563eb">Signal Admin Login</h1><p>Your sign-in code is:</p><h2 style="font-family:monospace;font-size:36px;letter-spacing:8px">${otp}</h2><p>This code expires in ${OTP_TTL_MINUTES} minutes. If you did not request it, ignore this email.</p>`,
       text: `Your Signal admin sign-in code is ${otp}. It expires in ${OTP_TTL_MINUTES} minutes. If you did not request it, ignore this email.`,
     }),
   });
