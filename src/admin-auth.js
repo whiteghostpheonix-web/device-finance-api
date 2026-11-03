@@ -33,9 +33,19 @@ function randomToken() {
   return [...randomBytes(32)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+// Derive the OTP HMAC from the Resend API key so no separate OTP pepper is needed.
+// Rotating the Resend key invalidates any OTP challenge created with the prior key.
 async function otpDigest(env, email, otp) {
-  if (!env.ADMIN_OTP_PEPPER) throw new Error('ADMIN_OTP_PEPPER is not configured');
-  return sha256(`${env.ADMIN_OTP_PEPPER}:${email}:${otp}`);
+  if (!env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not configured');
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(env.RESEND_API_KEY),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const digest = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${email}:${otp}`));
+  return bytesToHex(digest);
 }
 
 async function readJson(request) {
@@ -116,7 +126,8 @@ export function isAdminProtectedPath(path, method) {
 }
 
 async function sendOtp(env, email, otp) {
-  if (!env.RESEND_API_KEY || !env.RESEND_FROM) throw new Error('Resend is not configured');
+  if (!env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not configured');
+  if (!env.RESEND_FROM) throw new Error('RESEND_FROM is not configured');
   const result = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
@@ -128,8 +139,10 @@ async function sendOtp(env, email, otp) {
     }),
   });
   if (!result.ok) {
-    console.error('Resend rejected admin OTP email', result.status);
-    throw new Error('OTP email could not be sent');
+    const providerBody = await result.text().catch(() => '');
+    // Log provider diagnostics, never the API key or OTP.
+    console.error('Resend rejected admin OTP email', JSON.stringify({ status: result.status, body: providerBody.slice(0, 1000) }));
+    throw new Error(`Resend rejected OTP email (HTTP ${result.status})`);
   }
 }
 
