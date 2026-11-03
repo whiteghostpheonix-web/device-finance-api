@@ -1,260 +1,214 @@
-const DEFAULT_ADMIN_EMAIL = 'whiteghostpheonix@gmail.com';
+const ADMIN_EMAILS = new Set(['whiteghostpheonix@gmail.com']);
+const OTP_TTL_MINUTES = 10;
+const SESSION_TTL_HOURS = 8;
 
-function corsHeaders(origin) {
-  return {
-    'Access-Control-Allow-Origin': origin || '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, x-admin-token, CF-Access-Client-Id, CF-Access-Client-Secret',
-    'Access-Control-Allow-Credentials': 'true',
-    'Access-Control-Max-Age': '86400',
-  };
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
 }
 
-function jsonResponse(data, status = 200, origin = null) {
-  return new Response(JSON.stringify(data), {
+function bytesToHex(bytes) {
+  return [...new Uint8Array(bytes)].map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+async function sha256(value) {
+  return bytesToHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)));
+}
+
+function randomBytes(length) {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return bytes;
+}
+
+function randomOtp() {
+  const n = new DataView(randomBytes(4).buffer).getUint32(0) % 1000000;
+  return String(n).padStart(6, '0');
+}
+
+function randomToken() {
+  return [...randomBytes(32)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function otpDigest(env, email, otp) {
+  if (!env.ADMIN_OTP_PEPPER) throw new Error('ADMIN_OTP_PEPPER is not configured');
+  return sha256(`${env.ADMIN_OTP_PEPPER}:${email}:${otp}`);
+}
+
+async function readJson(request) {
+  try { return await request.json(); } catch { return {}; }
+}
+
+function response(data, status, origin) {
+  return Response.json(data, {
     status,
     headers: {
-      ...corsHeaders(origin),
-      'content-type': 'application/json',
+      'Access-Control-Allow-Origin': origin || 'https://signal-dashboard.whiteghostpheonix.workers.dev',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Max-Age': '86400',
+      'Cache-Control': 'no-store',
+      'Vary': 'Origin',
     },
   });
 }
 
-function normalizeEmail(email) {
-  return String(email || '').trim().toLowerCase();
-}
-
-async function sha256Hex(value) {
-  const bytes = new TextEncoder().encode(value);
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function generateOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
-function makeToken() {
-  return crypto.randomUUID();
-}
-
-export async function ensureAdminTables(env) {
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS admins (
-      id TEXT PRIMARY KEY,
-      email TEXT NOT NULL UNIQUE,
-      display_name TEXT NOT NULL,
-      active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS admin_otp_challenges (
-      id TEXT PRIMARY KEY,
-      admin_id TEXT NOT NULL,
-      otp_hash TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      consumed_at TEXT,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (admin_id) REFERENCES admins(id)
-    )
-  `).run();
-
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS admin_sessions (
-      token_hash TEXT PRIMARY KEY,
-      admin_id TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      revoked_at TEXT,
-      FOREIGN KEY (admin_id) REFERENCES admins(id)
-    )
-  `).run();
-
-  const email = DEFAULT_ADMIN_EMAIL.toLowerCase();
-  const existing = await env.DB.prepare('SELECT id FROM admins WHERE email = ?').bind(email).first();
-  if (!existing) {
-    await env.DB.prepare('INSERT INTO admins (id, email, display_name, active) VALUES (?, ?, ?, 1)').bind(
-      crypto.randomUUID(),
-      email,
-      'Primary Admin',
-    ).run();
-  }
-}
-
-async function getAdminByEmail(env, email) {
-  return env.DB.prepare('SELECT * FROM admins WHERE email = ?').bind(normalizeEmail(email)).first();
-}
-
-async function getRequestAdmin(request, env) {
-  const auth = request.headers.get('Authorization');
-  const token = auth && auth.startsWith('Bearer ') ? auth.slice(7).trim() : request.headers.get('x-admin-token');
-
-  if (token) {
-    const tokenHash = await sha256Hex(token);
-    const row = await env.DB.prepare(`
-      SELECT a.*
-      FROM admin_sessions s
-      JOIN admins a ON a.id = s.admin_id
-      WHERE s.token_hash = ? AND s.expires_at > datetime('now') AND s.revoked_at IS NULL
-    `).bind(tokenHash).first();
-    return row || null;
-  }
-
-  const emailHeader = request.headers.get('cf-access-authenticated-user-email');
-  if (emailHeader) {
-    const admin = await getAdminByEmail(env, emailHeader);
-    return admin || null;
-  }
-
-  return null;
-}
-
-async function storeOtp(env, adminId, otp) {
-  const id = crypto.randomUUID();
-  const otpHash = await sha256Hex(String(otp));
-  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-  await env.DB.prepare(`
-    INSERT INTO admin_otp_challenges (id, admin_id, otp_hash, expires_at)
-    VALUES (?, ?, ?, ?)
-  `).bind(id, adminId, otpHash, expiresAt).run();
-  return { id, expiresAt };
-}
-
-async function sendOtpEmail(env, email, otp) {
-  const apiKey = env.RESEND_API_KEY;
-  if (!apiKey) {
-    console.warn('RESEND_API_KEY is missing; OTP email not sent.');
-    return false;
-  }
-  const from = env.RESEND_FROM || 'Signal Admin <noreply@signal-finance.app>';
-  const response = await fetch('https://api.resend.com/emails', {
+async function sendOtp(env, email, otp) {
+  if (!env.RESEND_API_KEY || !env.RESEND_FROM) throw new Error('Resend is not configured');
+  const result = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      Authorization: `Bearer ${env.RESEND_API_KEY}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      from,
+      from: env.RESEND_FROM,
       to: [email],
-      subject: 'Your admin login code',
-      html: `<p>Your admin login code is <strong>${otp}</strong>.</p><p>This code expires in 10 minutes.</p>`,
+      subject: 'Your Signal admin sign-in code',
+      text: `Your Signal admin sign-in code is ${otp}. It expires in ${OTP_TTL_MINUTES} minutes. If you did not request it, ignore this email.`,
     }),
   });
-  if (!response.ok) {
-    console.warn('Resend email failed:', await response.text());
-    return false;
+  if (!result.ok) {
+    console.error('Resend rejected admin OTP email', result.status);
+    throw new Error('OTP email could not be sent');
   }
-  return true;
 }
 
-async function issueSession(env, adminId) {
-  const token = makeToken();
-  const tokenHash = await sha256Hex(token);
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-  await env.DB.prepare(`
-    INSERT INTO admin_sessions (token_hash, admin_id, expires_at)
-    VALUES (?, ?, ?)
-  `).bind(tokenHash, adminId, expiresAt).run();
-  return token;
+export async function getRequestAdmin(request, env) {
+  const authorization = request.headers.get('Authorization') || '';
+  if (!authorization.startsWith('Bearer ')) return null;
+  const token = authorization.slice(7).trim();
+  if (!/^[a-f0-9]{64}$/.test(token)) return null;
+  const tokenHash = await sha256(token);
+  return env.DB.prepare(`
+    SELECT a.id, a.email, a.display_name
+    FROM admin_sessions s
+    JOIN admins a ON a.id = s.admin_id
+    WHERE s.token_hash = ? AND s.expires_at > datetime('now')
+      AND s.revoked_at IS NULL AND a.active = 1
+    LIMIT 1
+  `).bind(tokenHash).first();
 }
 
-function parseJsonBody(request) {
-  return request.text().then((text) => {
-    if (!text) return {};
-    try { return JSON.parse(text); } catch { return {}; }
-  });
+export function isAdminProtectedPath(path, method) {
+  if (path.startsWith('/api/dashboard/')) return true;
+  if (path === '/api/plans' || path === '/api/resellers' || path === '/api/payments') return true;
+  if (path.startsWith('/api/commands/')) return true;
+  if (path === '/api/devices' && method !== 'GET') return true;
+  if (path === '/api/customers' || path === '/api/assign-plan' || path === '/api/validate-nin') return true;
+  return false;
 }
 
-export async function handleAdminRoute({ request, env, origin }) {
+export async function handleAdminRoute(request, env, origin) {
   const url = new URL(request.url);
   const path = url.pathname;
 
   if (path === '/api/admin/request-otp' && request.method === 'POST') {
-    const body = await parseJsonBody(request);
-    const email = normalizeEmail(body.email || '');
-    if (!email) return jsonResponse({ error: 'Email required' }, 400, origin);
-
-    const admin = await getAdminByEmail(env, email);
-    if (!admin || admin.active === 0) {
-      return jsonResponse({ error: 'Admin account not found' }, 404, origin);
+    const body = await readJson(request);
+    const email = normalizeEmail(body.email);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return response({ error: 'Enter a valid admin email address' }, 400, origin);
     }
 
-    const otp = generateOtp();
-    await storeOtp(env, admin.id, otp);
-    await sendOtpEmail(env, email, otp);
+    // Keep responses identical for unknown emails to avoid account enumeration.
+    if (!ADMIN_EMAILS.has(email)) {
+      return response({ ok: true, message: 'If this address is authorized, a sign-in code will be sent.' }, 200, origin);
+    }
 
-    return jsonResponse({ ok: true, message: 'OTP sent to email' }, 200, origin);
+    try {
+      const admin = await env.DB.prepare('SELECT id FROM admins WHERE email = ? AND active = 1').bind(email).first();
+      if (!admin) return response({ ok: true, message: 'If this address is authorized, a sign-in code will be sent.' }, 200, origin);
+
+      const recent = await env.DB.prepare(`
+        SELECT COUNT(*) AS count FROM admin_otp_challenges
+        WHERE admin_id = ? AND created_at > datetime('now', '-15 minutes')
+      `).bind(admin.id).first();
+      if (Number(recent?.count || 0) >= 3) {
+        return response({ error: 'Too many codes requested. Wait 15 minutes and try again.' }, 429, origin);
+      }
+
+      const otp = randomOtp();
+      const digest = await otpDigest(env, email, otp);
+      await env.DB.prepare(`
+        INSERT INTO admin_otp_challenges (id, admin_id, otp_hash, expires_at)
+        VALUES (?, ?, ?, datetime('now', '+${OTP_TTL_MINUTES} minutes'))
+      `).bind(crypto.randomUUID(), admin.id, digest).run();
+      await sendOtp(env, email, otp);
+      return response({ ok: true, message: 'If this address is authorized, a sign-in code will be sent.' }, 200, origin);
+    } catch (error) {
+      console.error('Admin OTP request failed:', error.message);
+      return response({ error: 'Unable to send a sign-in code right now. Check server configuration.' }, 503, origin);
+    }
   }
 
   if (path === '/api/admin/verify-otp' && request.method === 'POST') {
-    const body = await parseJsonBody(request);
-    const email = normalizeEmail(body.email || '');
-    const otp = String(body.otp || '');
-    if (!email || !otp) return jsonResponse({ error: 'Email and OTP are required' }, 400, origin);
-
-    const admin = await getAdminByEmail(env, email);
-    if (!admin || admin.active === 0) return jsonResponse({ error: 'Admin account not found' }, 404, origin);
-
-    const challenge = await env.DB.prepare(`
-      SELECT * FROM admin_otp_challenges
-      WHERE admin_id = ? AND expires_at > datetime('now')
-      ORDER BY created_at DESC LIMIT 1
-    `).bind(admin.id).first();
-
-    if (!challenge) return jsonResponse({ error: 'No active OTP challenge' }, 401, origin);
-    const challengeHash = await sha256Hex(otp);
-    if (challenge.otp_hash !== challengeHash) {
-      await env.DB.prepare('UPDATE admin_otp_challenges SET attempts = attempts + 1 WHERE id = ?').bind(challenge.id).run();
-      return jsonResponse({ error: 'Invalid OTP' }, 401, origin);
+    const body = await readJson(request);
+    const email = normalizeEmail(body.email);
+    const otp = String(body.otp || '').trim();
+    if (!ADMIN_EMAILS.has(email) || !/^\d{6}$/.test(otp)) {
+      return response({ error: 'Invalid or expired code' }, 401, origin);
     }
 
-    await env.DB.prepare('UPDATE admin_otp_challenges SET consumed_at = datetime("now") WHERE id = ?').bind(challenge.id).run();
-    const token = await issueSession(env, admin.id);
-    return jsonResponse({ ok: true, token, admin: { id: admin.id, email: admin.email, display_name: admin.display_name } }, 200, origin);
+    const admin = await env.DB.prepare('SELECT id, email, display_name FROM admins WHERE email = ? AND active = 1').bind(email).first();
+    if (!admin) return response({ error: 'Invalid or expired code' }, 401, origin);
+    const challenge = await env.DB.prepare(`
+      SELECT id, otp_hash, attempts FROM admin_otp_challenges
+      WHERE admin_id = ? AND consumed_at IS NULL AND expires_at > datetime('now')
+      ORDER BY created_at DESC LIMIT 1
+    `).bind(admin.id).first();
+    if (!challenge || Number(challenge.attempts) >= 5) return response({ error: 'Invalid or expired code' }, 401, origin);
+
+    const digest = await otpDigest(env, email, otp);
+    if (digest !== challenge.otp_hash) {
+      await env.DB.prepare('UPDATE admin_otp_challenges SET attempts = attempts + 1 WHERE id = ?').bind(challenge.id).run();
+      return response({ error: 'Invalid or expired code' }, 401, origin);
+    }
+
+    await env.DB.prepare('UPDATE admin_otp_challenges SET consumed_at = datetime(\'now\') WHERE id = ?').bind(challenge.id).run();
+    const token = randomToken();
+    const tokenHash = await sha256(token);
+    await env.DB.prepare(`
+      INSERT INTO admin_sessions (token_hash, admin_id, expires_at)
+      VALUES (?, ?, datetime('now', '+${SESSION_TTL_HOURS} hours'))
+    `).bind(tokenHash, admin.id).run();
+    return response({ ok: true, token, admin }, 200, origin);
   }
 
   if (path === '/api/admin/me' && request.method === 'GET') {
     const admin = await getRequestAdmin(request, env);
-    if (!admin) return jsonResponse({ error: 'Unauthorized' }, 401, origin);
-    return jsonResponse({ admin: { id: admin.id, email: admin.email, display_name: admin.display_name } }, 200, origin);
+    if (!admin) return response({ error: 'Unauthorized' }, 401, origin);
+    return response({ admin }, 200, origin);
   }
 
   if (path === '/api/admin/logout' && request.method === 'POST') {
-    const token = request.headers.get('Authorization')?.startsWith('Bearer ') ? request.headers.get('Authorization').slice(7).trim() : request.headers.get('x-admin-token');
-    if (token) {
-      const tokenHash = await sha256Hex(token);
-      await env.DB.prepare('UPDATE admin_sessions SET revoked_at = datetime("now") WHERE token_hash = ?').bind(tokenHash).run();
+    const authorization = request.headers.get('Authorization') || '';
+    const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+    if (token && /^[a-f0-9]{64}$/.test(token)) {
+      await env.DB.prepare('UPDATE admin_sessions SET revoked_at = datetime(\'now\') WHERE token_hash = ?').bind(await sha256(token)).run();
     }
-    return jsonResponse({ ok: true }, 200, origin);
+    return response({ ok: true }, 200, origin);
   }
 
   if (path === '/api/admin/users' && request.method === 'GET') {
-    const admin = await getRequestAdmin(request, env);
-    if (!admin) return jsonResponse({ error: 'Unauthorized' }, 401, origin);
-    const rows = await env.DB.prepare('SELECT id, email, display_name, active, created_at FROM admins ORDER BY created_at DESC').all();
-    return jsonResponse({ users: rows.results || [] }, 200, origin);
+    const actor = await getRequestAdmin(request, env);
+    if (!actor) return response({ error: 'Unauthorized' }, 401, origin);
+    const rows = await env.DB.prepare('SELECT id, email, display_name, active, created_at FROM admins ORDER BY created_at').all();
+    return response({ users: rows.results || [] }, 200, origin);
   }
 
   if (path === '/api/admin/users' && request.method === 'POST') {
-    const admin = await getRequestAdmin(request, env);
-    if (!admin) return jsonResponse({ error: 'Unauthorized' }, 401, origin);
-    const body = await parseJsonBody(request);
-    const email = normalizeEmail(body.email || '');
-    const displayName = String(body.display_name || body.name || email.split('@')[0]);
-    if (!email) return jsonResponse({ error: 'Email required' }, 400, origin);
-    const exists = await getAdminByEmail(env, email);
-    if (exists) return jsonResponse({ error: 'Admin already exists' }, 409, origin);
-    const id = crypto.randomUUID();
-    await env.DB.prepare('INSERT INTO admins (id, email, display_name, active) VALUES (?, ?, ?, 1)').bind(id, email, displayName).run();
-    return jsonResponse({ ok: true, admin: { id, email, display_name: displayName } }, 200, origin);
-  }
-
-  if (path.startsWith('/api/dashboard/') && request.method === 'GET') {
-    const admin = await getRequestAdmin(request, env);
-    if (!admin) return jsonResponse({ error: 'Unauthorized' }, 401, origin);
+    const actor = await getRequestAdmin(request, env);
+    if (!actor) return response({ error: 'Unauthorized' }, 401, origin);
+    const body = await readJson(request);
+    const email = normalizeEmail(body.email);
+    const displayName = String(body.display_name || email.split('@')[0]).trim().slice(0, 100);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return response({ error: 'Enter a valid email address' }, 400, origin);
+    try {
+      const id = crypto.randomUUID();
+      await env.DB.prepare('INSERT INTO admins (id, email, display_name, active) VALUES (?, ?, ?, 1)').bind(id, email, displayName).run();
+      return response({ ok: true, admin: { id, email, display_name: displayName, active: 1 } }, 201, origin);
+    } catch {
+      return response({ error: 'Admin already exists or could not be added' }, 409, origin);
+    }
   }
 
   return null;
