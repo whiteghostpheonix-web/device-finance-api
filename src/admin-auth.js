@@ -1,6 +1,12 @@
-const ADMIN_EMAILS = new Set(['whiteghostpheonix@gmail.com']);
 const OTP_TTL_MINUTES = 10;
 const SESSION_TTL_HOURS = 8;
+const INITIAL_ADMIN_EMAIL = 'whiteghostpheonix@gmail.com';
+const ALLOWED_ORIGINS = new Set([
+  'https://signal-dashboard.whiteghostpheonix.workers.dev',
+  'https://www.signal-dashboard.whiteghostpheonix.workers.dev',
+  'http://localhost:5173',
+  'http://localhost:3000',
+]);
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
@@ -38,11 +44,12 @@ async function readJson(request) {
   try { return await request.json(); } catch { return {}; }
 }
 
-function response(data, status, origin) {
+function response(data, status, requestOrigin) {
+  const origin = ALLOWED_ORIGINS.has(requestOrigin) ? requestOrigin : 'https://signal-dashboard.whiteghostpheonix.workers.dev';
   return Response.json(data, {
     status,
     headers: {
-      'Access-Control-Allow-Origin': origin || 'https://signal-dashboard.whiteghostpheonix.workers.dev',
+      'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
       'Access-Control-Max-Age': '86400',
@@ -52,25 +59,42 @@ function response(data, status, origin) {
   });
 }
 
-async function sendOtp(env, email, otp) {
-  if (!env.RESEND_API_KEY || !env.RESEND_FROM) throw new Error('Resend is not configured');
-  const result = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: env.RESEND_FROM,
-      to: [email],
-      subject: 'Your Signal admin sign-in code',
-      text: `Your Signal admin sign-in code is ${otp}. It expires in ${OTP_TTL_MINUTES} minutes. If you did not request it, ignore this email.`,
-    }),
-  });
-  if (!result.ok) {
-    console.error('Resend rejected admin OTP email', result.status);
-    throw new Error('OTP email could not be sent');
-  }
+export async function ensureAdminTables(env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS admins (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      display_name TEXT NOT NULL,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS admin_otp_challenges (
+      id TEXT PRIMARY KEY,
+      admin_id TEXT NOT NULL,
+      otp_hash TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (admin_id) REFERENCES admins(id)
+    )
+  `).run();
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS admin_sessions (
+      token_hash TEXT PRIMARY KEY,
+      admin_id TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      revoked_at TEXT,
+      FOREIGN KEY (admin_id) REFERENCES admins(id)
+    )
+  `).run();
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO admins (id, email, display_name, active)
+    VALUES ('primary-admin', ?, 'Primary Admin', 1)
+  `).bind(INITIAL_ADMIN_EMAIL).run();
 }
 
 export async function getRequestAdmin(request, env) {
@@ -91,16 +115,38 @@ export async function getRequestAdmin(request, env) {
 
 export function isAdminProtectedPath(path, method) {
   if (path.startsWith('/api/dashboard/')) return true;
-  if (path === '/api/plans' || path === '/api/resellers' || path === '/api/payments') return true;
+  if (path === '/api/plans' || path.startsWith('/api/plans/')) return true;
+  if (path === '/api/resellers' || path.startsWith('/api/resellers/')) return true;
+  if (path === '/api/payments' || path.startsWith('/api/payments/')) return true;
   if (path.startsWith('/api/commands/')) return true;
-  if (path === '/api/devices' && method !== 'GET') return true;
-  if (path === '/api/customers' || path === '/api/assign-plan' || path === '/api/validate-nin') return true;
+  if (path === '/api/devices' || path.startsWith('/api/devices/')) return true;
+  if (path === '/api/customers' || path.startsWith('/api/customers/')) return true;
+  if (path.startsWith('/api/reports/')) return true;
+  if (path === '/api/assign-plan' || path === '/api/validate-nin') return true;
   return false;
 }
 
-export async function handleAdminRoute(request, env, origin) {
-  const url = new URL(request.url);
-  const path = url.pathname;
+async function sendOtp(env, email, otp) {
+  if (!env.RESEND_API_KEY || !env.RESEND_FROM) throw new Error('Resend is not configured');
+  const result = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: env.RESEND_FROM,
+      to: [email],
+      subject: 'Your Signal admin sign-in code',
+      text: `Your Signal admin sign-in code is ${otp}. It expires in ${OTP_TTL_MINUTES} minutes. If you did not request it, ignore this email.`,
+    }),
+  });
+  if (!result.ok) {
+    console.error('Resend rejected admin OTP email', result.status);
+    throw new Error('OTP email could not be sent');
+  }
+}
+
+export async function handleAdminRoute(request, env) {
+  const origin = request.headers.get('Origin') || '';
+  const path = new URL(request.url).pathname;
 
   if (path === '/api/admin/request-otp' && request.method === 'POST') {
     const body = await readJson(request);
@@ -109,13 +155,9 @@ export async function handleAdminRoute(request, env, origin) {
       return response({ error: 'Enter a valid admin email address' }, 400, origin);
     }
 
-    // Keep responses identical for unknown emails to avoid account enumeration.
-    if (!ADMIN_EMAILS.has(email)) {
-      return response({ ok: true, message: 'If this address is authorized, a sign-in code will be sent.' }, 200, origin);
-    }
-
     try {
       const admin = await env.DB.prepare('SELECT id FROM admins WHERE email = ? AND active = 1').bind(email).first();
+      // Do not reveal whether an email is registered as an admin.
       if (!admin) return response({ ok: true, message: 'If this address is authorized, a sign-in code will be sent.' }, 200, origin);
 
       const recent = await env.DB.prepare(`
@@ -144,7 +186,7 @@ export async function handleAdminRoute(request, env, origin) {
     const body = await readJson(request);
     const email = normalizeEmail(body.email);
     const otp = String(body.otp || '').trim();
-    if (!ADMIN_EMAILS.has(email) || !/^\d{6}$/.test(otp)) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp)) {
       return response({ error: 'Invalid or expired code' }, 401, origin);
     }
 
@@ -165,11 +207,10 @@ export async function handleAdminRoute(request, env, origin) {
 
     await env.DB.prepare('UPDATE admin_otp_challenges SET consumed_at = datetime(\'now\') WHERE id = ?').bind(challenge.id).run();
     const token = randomToken();
-    const tokenHash = await sha256(token);
     await env.DB.prepare(`
       INSERT INTO admin_sessions (token_hash, admin_id, expires_at)
       VALUES (?, ?, datetime('now', '+${SESSION_TTL_HOURS} hours'))
-    `).bind(tokenHash, admin.id).run();
+    `).bind(await sha256(token), admin.id).run();
     return response({ ok: true, token, admin }, 200, origin);
   }
 
@@ -182,22 +223,20 @@ export async function handleAdminRoute(request, env, origin) {
   if (path === '/api/admin/logout' && request.method === 'POST') {
     const authorization = request.headers.get('Authorization') || '';
     const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
-    if (token && /^[a-f0-9]{64}$/.test(token)) {
+    if (/^[a-f0-9]{64}$/.test(token)) {
       await env.DB.prepare('UPDATE admin_sessions SET revoked_at = datetime(\'now\') WHERE token_hash = ?').bind(await sha256(token)).run();
     }
     return response({ ok: true }, 200, origin);
   }
 
   if (path === '/api/admin/users' && request.method === 'GET') {
-    const actor = await getRequestAdmin(request, env);
-    if (!actor) return response({ error: 'Unauthorized' }, 401, origin);
+    if (!await getRequestAdmin(request, env)) return response({ error: 'Unauthorized' }, 401, origin);
     const rows = await env.DB.prepare('SELECT id, email, display_name, active, created_at FROM admins ORDER BY created_at').all();
     return response({ users: rows.results || [] }, 200, origin);
   }
 
   if (path === '/api/admin/users' && request.method === 'POST') {
-    const actor = await getRequestAdmin(request, env);
-    if (!actor) return response({ error: 'Unauthorized' }, 401, origin);
+    if (!await getRequestAdmin(request, env)) return response({ error: 'Unauthorized' }, 401, origin);
     const body = await readJson(request);
     const email = normalizeEmail(body.email);
     const displayName = String(body.display_name || email.split('@')[0]).trim().slice(0, 100);
