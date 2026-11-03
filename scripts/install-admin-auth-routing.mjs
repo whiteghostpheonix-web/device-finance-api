@@ -12,7 +12,6 @@ if (!source.includes(importLine)) {
 const fetchAnchor = "    if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });";
 const integration = `    if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
-    // Create auth tables and seed the first authorized admin before auth routes run.
     if (path.startsWith('/api/admin/') || isAdminProtectedPath(path, request.method)) {
       await ensureAdminTables(env);
     }
@@ -29,5 +28,5 @@ if (source.includes('const adminResponse = await handleAdminRoute(request, env);
 if (!source.includes(fetchAnchor)) throw new Error('Could not find fetch preflight anchor. No files changed.');
 source = source.replace(fetchAnchor, integration);
 fs.writeFileSync(path, source);
-console.log('Installed admin OTP/session routing and auth checks for configured admin API paths.');
-console.log('Run a local build and review git diff before deploying.');
+console.log('Installed admin OTP/session routing and auth checks.');
+console.log('Existing global CORS behavior was intentionally preserved to avoid changing retailer/client API CORS.');

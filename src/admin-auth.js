@@ -2,8 +2,7 @@ const OTP_TTL_MINUTES = 10;
 const SESSION_TTL_HOURS = 8;
 const INITIAL_ADMIN_EMAIL = 'whiteghostpheonix@gmail.com';
 const ALLOWED_ORIGINS = new Set([
-  'https://signal-dashboard.whiteghostpheonix.workers.dev',
-  'https://www.signal-dashboard.whiteghostpheonix.workers.dev',
+  'https://signal-admin.whiteghostpheonix.workers.dev',
   'http://localhost:5173',
   'http://localhost:3000',
 ]);
@@ -46,7 +45,7 @@ async function readJson(request) {
 function response(data, status, requestOrigin) {
   const origin = ALLOWED_ORIGINS.has(requestOrigin)
     ? requestOrigin
-    : 'https://signal-dashboard.whiteghostpheonix.workers.dev';
+    : 'https://signal-admin.whiteghostpheonix.workers.dev';
   return Response.json(data, {
     status,
     headers: {
@@ -137,27 +136,20 @@ async function sendOtp(env, email, otp) {
 export async function handleAdminRoute(request, env) {
   const origin = request.headers.get('Origin') || '';
   const path = new URL(request.url).pathname;
-
   if (path === '/api/admin/request-otp' && request.method === 'POST') {
     const { email: rawEmail } = await readJson(request);
     const email = normalizeEmail(rawEmail);
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return response({ error: 'Enter a valid admin email address' }, 400, origin);
-    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return response({ error: 'Enter a valid admin email address' }, 400, origin);
     try {
       const admin = await env.DB.prepare('SELECT id FROM admins WHERE email = ? AND active = 1').bind(email).first();
-      // Same response for registered and unregistered addresses prevents account enumeration.
       if (!admin) return response({ ok: true, message: 'If this address is authorized, a sign-in code will be sent.' }, 200, origin);
       const recent = await env.DB.prepare(`SELECT COUNT(*) AS count FROM admin_otp_challenges
         WHERE admin_id = ? AND created_at > datetime('now', '-15 minutes')`).bind(admin.id).first();
-      if (Number(recent?.count || 0) >= 3) {
-        return response({ error: 'Too many codes requested. Wait 15 minutes and try again.' }, 429, origin);
-      }
+      if (Number(recent?.count || 0) >= 3) return response({ error: 'Too many codes requested. Wait 15 minutes and try again.' }, 429, origin);
       const otp = randomOtp();
-      const digest = await otpDigest(env, email, otp);
       await env.DB.prepare(`INSERT INTO admin_otp_challenges (id, admin_id, otp_hash, expires_at)
         VALUES (?, ?, ?, datetime('now', '+${OTP_TTL_MINUTES} minutes'))`)
-        .bind(crypto.randomUUID(), admin.id, digest).run();
+        .bind(crypto.randomUUID(), admin.id, await otpDigest(env, email, otp)).run();
       await sendOtp(env, email, otp);
       return response({ ok: true, message: 'If this address is authorized, a sign-in code will be sent.' }, 200, origin);
     } catch (error) {
@@ -165,14 +157,11 @@ export async function handleAdminRoute(request, env) {
       return response({ error: 'Unable to send a sign-in code right now. Check server configuration.' }, 503, origin);
     }
   }
-
   if (path === '/api/admin/verify-otp' && request.method === 'POST') {
     const body = await readJson(request);
     const email = normalizeEmail(body.email);
     const otp = String(body.otp || '').trim();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp)) {
-      return response({ error: 'Invalid or expired code' }, 401, origin);
-    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp)) return response({ error: 'Invalid or expired code' }, 401, origin);
     const admin = await env.DB.prepare('SELECT id, email, display_name FROM admins WHERE email = ? AND active = 1').bind(email).first();
     if (!admin) return response({ error: 'Invalid or expired code' }, 401, origin);
     const challenge = await env.DB.prepare(`SELECT id, otp_hash, attempts FROM admin_otp_challenges
@@ -189,27 +178,21 @@ export async function handleAdminRoute(request, env) {
       VALUES (?, ?, datetime('now', '+${SESSION_TTL_HOURS} hours'))`).bind(await sha256(token), admin.id).run();
     return response({ ok: true, token, admin }, 200, origin);
   }
-
   if (path === '/api/admin/me' && request.method === 'GET') {
     const admin = await getRequestAdmin(request, env);
     return admin ? response({ admin }, 200, origin) : response({ error: 'Unauthorized' }, 401, origin);
   }
-
   if (path === '/api/admin/logout' && request.method === 'POST') {
     const authorization = request.headers.get('Authorization') || '';
     const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
-    if (/^[a-f0-9]{64}$/.test(token)) {
-      await env.DB.prepare("UPDATE admin_sessions SET revoked_at = datetime('now') WHERE token_hash = ?").bind(await sha256(token)).run();
-    }
+    if (/^[a-f0-9]{64}$/.test(token)) await env.DB.prepare("UPDATE admin_sessions SET revoked_at = datetime('now') WHERE token_hash = ?").bind(await sha256(token)).run();
     return response({ ok: true }, 200, origin);
   }
-
   if (path === '/api/admin/users' && request.method === 'GET') {
     if (!await getRequestAdmin(request, env)) return response({ error: 'Unauthorized' }, 401, origin);
     const result = await env.DB.prepare('SELECT id, email, display_name, active, created_at FROM admins ORDER BY created_at').all();
     return response({ users: result.results || [] }, 200, origin);
   }
-
   if (path === '/api/admin/users' && request.method === 'POST') {
     if (!await getRequestAdmin(request, env)) return response({ error: 'Unauthorized' }, 401, origin);
     const body = await readJson(request);
@@ -224,6 +207,5 @@ export async function handleAdminRoute(request, env) {
       return response({ error: 'Admin already exists or could not be added' }, 409, origin);
     }
   }
-
   return null;
 }
