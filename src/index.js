@@ -1,4 +1,3 @@
-import { getAccessToken, registerIpn, listIpns, submitOrder, getTransactionStatus } from './pesapal.js';
 import { collectPayment, verifyRohoWebhook } from './rohopay.js';
 import { sendFcm } from './fcm.js';
 
@@ -302,9 +301,9 @@ export default {
       if (path === '/health') return json({ status: 'ok', market: 'Uganda', time: new Date().toISOString() });
 
       // ── Customer payment page ────────────────────
-      // ── Customer payment: redirect to Pesapal ──
+      // ── Customer payment: RohoPay STK Push ──
       // Usage: /pay?imei=XXX  OR  /pay?code=SGXXXX
-      //   → creates a Pesapal order for the next unpaid installment
+      //   → initiates a RohoPay payment for the selected installment
       if (path === '/pay' && (request.method === 'GET' || request.method === 'HEAD')) {
         const imei = url.searchParams.get('imei') || '';
         const html = `<!DOCTYPE html>
