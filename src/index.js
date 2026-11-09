@@ -5,7 +5,7 @@ import { handleAdminRequest } from './admin.js';
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, CF-Access-Client-Id, CF-Access-Client-Secret',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
 function json(data, status = 200) {
@@ -299,7 +299,7 @@ export default {
 
     try {
       // Protected admin API (Cloudflare Access identity + ADMIN_EMAILS allowlist)
-      if (path.startsWith('/admin/')) return await handleAdminRequest(request, env, url);
+      if (path.startsWith('/admin/') || path.startsWith('/api/admin/')) return await handleAdminRequest(request, env, url);
 
       // ── Health ────────────────────────────────
       if (path === '/health') return json({ status: 'ok', market: 'Uganda', time: new Date().toISOString() });

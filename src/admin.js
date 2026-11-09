@@ -1,3 +1,4 @@
+import { handleAdminAuth, getAdminSession, handleAdminSessionRoute } from "./admin-auth.js";
 const json = (data, status = 200) => Response.json(data, {
   status,
   headers: {
@@ -50,7 +51,7 @@ function requireString(value, field, max = 200) {
 }
 
 async function handle(request, env, url, admin) {
-  const path = url.pathname.replace(/\/+$/, '') || '/';
+  const path = url.pathname.replace(/^\/api/, '').replace(/\/+$/, '') || '/';
   const method = request.method;
 
   if (path === '/admin/customer-applications' && method === 'POST') {
@@ -186,35 +187,55 @@ async function handle(request, env, url, admin) {
     return json({ success: true, commission_id: commissionId, commission_amount_ugx: commission }, 201);
   }
 
+
+  if (path === '/admin/withdrawals' && method === 'GET') {
+    const status = url.searchParams.get('status');
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+    const result = status
+      ? await env.DB.prepare('SELECT * FROM reseller_withdrawals WHERE status = ? ORDER BY requested_at DESC LIMIT ?').bind(status, limit).all()
+      : await env.DB.prepare('SELECT * FROM reseller_withdrawals ORDER BY requested_at DESC LIMIT ?').bind(limit).all();
+    return json({ withdrawals: result.results || [] });
+  }
+
+  const withdrawalDecision = path.match(/^\\/admin\\/withdrawals\\/([^/]+)\\/decision$/);
+  if (withdrawalDecision && method === 'POST') {
+    const withdrawalId = decodeURIComponent(withdrawalDecision[1]);
+    const body = await readJson(request);
+    const decision = requireString(body.decision, 'decision', 20).toLowerCase();
+    if (!['approve', 'reject'].includes(decision)) return json({ error: 'decision must be approve or reject', code: 'VALIDATION_ERROR' }, 400);
+    const reason = decision === 'reject' ? requireString(body.reason, 'reason', 1000) : String(body.reason || '').slice(0, 1000);
+    const current = await env.DB.prepare('SELECT id,status FROM reseller_withdrawals WHERE id=?').bind(withdrawalId).first();
+    if (!current) return json({ error: 'Withdrawal not found', code: 'NOT_FOUND' }, 404);
+    if (current.status !== 'pending') return json({ error: 'Only pending withdrawals can be reviewed', code: 'CONFLICT' }, 409);
+    const nextStatus = decision === 'approve' ? 'approved' : 'rejected';
+    const result = await env.DB.prepare("UPDATE reseller_withdrawals SET status=?,decision_reason=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'")
+      .bind(nextStatus, reason || null, admin, withdrawalId).run();
+    if (!result.meta?.changes) return json({ error: 'Withdrawal was already reviewed', code: 'CONFLICT' }, 409);
+    await audit(env, admin, 'reseller_withdrawal_' + nextStatus, 'reseller_withdrawal', withdrawalId, { reason });
+    return json({ success: true, withdrawal_id: withdrawalId, status: nextStatus });
+  }
+
   return json({ error: 'Admin endpoint not found', code: 'NOT_FOUND' }, 404);
 }
 
 export async function handleAdminRequest(request, env, url) {
-  const configured = String(env.ADMIN_EMAILS || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
-  const email = (request.headers.get('cf-access-authenticated-user-email') || '').trim().toLowerCase();
-
-  if (!configured.length) {
-    return json({ error: 'Admin API is not configured. Set ADMIN_EMAILS and protect this Worker with Cloudflare Access.', code: 'ADMIN_NOT_CONFIGURED' }, 503);
-  }
-  if (!email || !configured.includes(email)) {
-    return json({ error: 'Administrator access required', code: 'UNAUTHORIZED' }, 401);
-  }
-
+  const authResponse = await handleAdminAuth(request, env, url);
+  if (authResponse) return authResponse;
+  const admin = await getAdminSession(request, env);
+  if (!admin) return json({ error: 'Administrator sign-in required', code: 'UNAUTHORIZED' }, 401);
+  const sessionResponse = await handleAdminSessionRoute(request, env, url, admin);
+  if (sessionResponse) return sessionResponse;
   try {
-    return await handle(request, env, url, email);
+    return await handle(request, env, url, admin.email);
   } catch (error) {
     const errorId = id();
     const status = Number.isInteger(error?.status) ? error.status : 500;
     const safeMessage = status >= 500 ? 'The request could not be completed' : (error.message || 'Invalid request');
     console.error('admin_api_error', { errorId, route: url.pathname, method: request.method, message: error?.message, stack: error?.stack });
     try {
-      await env.DB.prepare(`
-        INSERT INTO admin_api_errors (id, route, method, error_code, message, admin_email)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).bind(errorId, url.pathname, request.method, error?.code || 'INTERNAL_ERROR', String(error?.message || 'Unknown error').slice(0, 500), email).run();
-    } catch (logError) {
-      console.error('admin_error_log_failed', logError?.message || logError);
-    }
+      await env.DB.prepare("INSERT INTO admin_api_errors (id, route, method, error_code, message, admin_email) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(errorId, url.pathname, request.method, error?.code || 'INTERNAL_ERROR', String(error?.message || 'Unknown error').slice(0, 500), admin.email).run();
+    } catch (logError) { console.error('admin_error_log_failed', logError?.message || logError); }
     return json({ error: safeMessage, code: error?.code || 'INTERNAL_ERROR', error_id: errorId }, status);
   }
 }
