@@ -1,5 +1,6 @@
 import { collectPayment, verifyRohoWebhook } from './rohopay.js';
 import { sendFcm } from './fcm.js';
+import { handleAdminRequest } from './admin.js';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -297,6 +298,9 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
     try {
+      // Protected admin API (Cloudflare Access identity + ADMIN_EMAILS allowlist)
+      if (path.startsWith('/admin/')) return await handleAdminRequest(request, env, url);
+
       // ── Health ────────────────────────────────
       if (path === '/health') return json({ status: 'ok', market: 'Uganda', time: new Date().toISOString() });
 
@@ -862,9 +866,10 @@ if (REF) {
 
       return json({ error: 'Not found', path }, 404);
     } catch (error) {
+      const errorId = crypto.randomUUID();
       const msg = error?.message || error?.toString?.() || 'Unknown server error';
-      console.error('Worker error:', msg, error?.stack);
-      return json({ error: msg, stack: error?.stack || '' }, 500);
+      console.error('Worker error:', { errorId, path, method: request.method, message: msg, stack: error?.stack });
+      return json({ error: 'The request could not be completed', code: 'INTERNAL_ERROR', error_id: errorId }, 500);
     }
   },
 
