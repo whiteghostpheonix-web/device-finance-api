@@ -51,7 +51,7 @@ function requireString(value, field, max = 200) {
 }
 
 async function handle(request, env, url, admin) {
-  const path = url.pathname.replace(/\/+$/, '') || '/';
+  const path = url.pathname.replace(/^\/api/, '').replace(/\/+$/, '') || '/';
   const method = request.method;
 
   if (path === '/admin/customer-applications' && method === 'POST') {
