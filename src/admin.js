@@ -50,7 +50,7 @@ function requireString(value, field, max = 200) {
 }
 
 async function handle(request, env, url, admin) {
-  const path = url.pathname.replace(/\\/+$/, '') || '/';
+  const path = url.pathname.replace(/\/+$/, '') || '/';
   const method = request.method;
 
   if (path === '/admin/customer-applications' && method === 'POST') {
@@ -96,14 +96,14 @@ async function handle(request, env, url, admin) {
     return json({ applications: result.results || [] });
   }
 
-  const applicationMatch = path.match(/^\\/admin\\/customer-applications\\/([^/]+)$/);
+  const applicationMatch = path.match(/^\/admin\/customer-applications\/([^/]+)$/);
   if (applicationMatch && method === 'GET') {
     const application = await env.DB.prepare('SELECT * FROM customer_applications WHERE id = ?').bind(decodeURIComponent(applicationMatch[1])).first();
     if (!application) return json({ error: 'Customer application not found', code: 'NOT_FOUND' }, 404);
     return json({ application });
   }
 
-  const decisionMatch = path.match(/^\\/admin\\/customer-applications\\/([^/]+)\\/decision$/);
+  const decisionMatch = path.match(/^\/admin\/customer-applications\/([^/]+)\/decision$/);
   if (decisionMatch && method === 'POST') {
     const applicationId = decodeURIComponent(decisionMatch[1]);
     const body = await readJson(request);
