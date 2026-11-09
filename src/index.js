@@ -1,3 +1,4 @@
+import { handleAdminApi } from './admin.js';
 import { collectPayment, verifyRohoWebhook } from './rohopay.js';
 import { sendFcm } from './fcm.js';
 
@@ -297,6 +298,8 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
 
     try {
+      const adminResponse = await handleAdminApi(request, env, url);
+      if (adminResponse) return adminResponse;
       // ── Health ────────────────────────────────
       if (path === '/health') return json({ status: 'ok', market: 'Uganda', time: new Date().toISOString() });
 
@@ -864,7 +867,9 @@ if (REF) {
     } catch (error) {
       const msg = error?.message || error?.toString?.() || 'Unknown server error';
       console.error('Worker error:', msg, error?.stack);
-      return json({ error: msg, stack: error?.stack || '' }, 500);
+      const requestId = crypto.randomUUID();
+      console.error('Worker request failed:', { requestId, path, message: msg });
+      return json({ error: 'Internal server error', request_id: requestId }, 500);
     }
   },
 
