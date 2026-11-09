@@ -1,3 +1,4 @@
+import { handleAdminAuth, getAdminSession, handleAdminSessionRoute } from "./admin-auth.js";
 const json = (data, status = 200) => Response.json(data, {
   status,
   headers: {
@@ -190,31 +191,23 @@ async function handle(request, env, url, admin) {
 }
 
 export async function handleAdminRequest(request, env, url) {
-  const configured = String(env.ADMIN_EMAILS || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
-  const email = (request.headers.get('cf-access-authenticated-user-email') || '').trim().toLowerCase();
-
-  if (!configured.length) {
-    return json({ error: 'Admin API is not configured. Set ADMIN_EMAILS and protect this Worker with Cloudflare Access.', code: 'ADMIN_NOT_CONFIGURED' }, 503);
-  }
-  if (!email || !configured.includes(email)) {
-    return json({ error: 'Administrator access required', code: 'UNAUTHORIZED' }, 401);
-  }
-
+  const authResponse = await handleAdminAuth(request, env, url);
+  if (authResponse) return authResponse;
+  const admin = await getAdminSession(request, env);
+  if (!admin) return json({ error: 'Administrator sign-in required', code: 'UNAUTHORIZED' }, 401);
+  const sessionResponse = await handleAdminSessionRoute(request, env, url, admin);
+  if (sessionResponse) return sessionResponse;
   try {
-    return await handle(request, env, url, email);
+    return await handle(request, env, url, admin.email);
   } catch (error) {
     const errorId = id();
     const status = Number.isInteger(error?.status) ? error.status : 500;
     const safeMessage = status >= 500 ? 'The request could not be completed' : (error.message || 'Invalid request');
     console.error('admin_api_error', { errorId, route: url.pathname, method: request.method, message: error?.message, stack: error?.stack });
     try {
-      await env.DB.prepare(`
-        INSERT INTO admin_api_errors (id, route, method, error_code, message, admin_email)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).bind(errorId, url.pathname, request.method, error?.code || 'INTERNAL_ERROR', String(error?.message || 'Unknown error').slice(0, 500), email).run();
-    } catch (logError) {
-      console.error('admin_error_log_failed', logError?.message || logError);
-    }
+      await env.DB.prepare("INSERT INTO admin_api_errors (id, route, method, error_code, message, admin_email) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(errorId, url.pathname, request.method, error?.code || 'INTERNAL_ERROR', String(error?.message || 'Unknown error').slice(0, 500), admin.email).run();
+    } catch (logError) { console.error('admin_error_log_failed', logError?.message || logError); }
     return json({ error: safeMessage, code: error?.code || 'INTERNAL_ERROR', error_id: errorId }, status);
   }
 }
