@@ -37,7 +37,8 @@ export async function handleAdminAuth(req,env,url){
    const b=await req.json(),email=emailOf(b.email),otp=String(b.otp||"").trim();
    if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!/^\d{6}$/.test(otp))return json({error:"Valid email and six-digit code are required"},400);
    const row=await env.DB.prepare("SELECT id,code_hash,attempts FROM admin_otp_codes WHERE email=? AND attempts<5 AND expires_at>CURRENT_TIMESTAMP ORDER BY created_at DESC LIMIT 1").bind(email).first();
-   if(!row)return json({error:"Invalid or expired sign-in code"},401);\n   if((await hash(otp))!==row.code_hash){await env.DB.prepare("UPDATE admin_otp_codes SET attempts=attempts+1 WHERE id=?").bind(row.id).run();return json({error:"Invalid or expired sign-in code"},401);}
+   if(!row)return json({error:"Invalid or expired sign-in code"},401);
+   if((await hash(otp))!==row.code_hash){await env.DB.prepare("UPDATE admin_otp_codes SET attempts=attempts+1 WHERE id=?").bind(row.id).run();return json({error:"Invalid or expired sign-in code"},401);}
    await env.DB.prepare("DELETE FROM admin_otp_codes WHERE email=?").bind(email).run();
    const u=await env.DB.prepare("SELECT id,email,display_name,role FROM admin_users WHERE email=? AND active=1").bind(email).first();
    if(!u)return json({error:"Administrator account is not active"},403);
