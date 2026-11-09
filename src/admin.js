@@ -187,6 +187,34 @@ async function handle(request, env, url, admin) {
     return json({ success: true, commission_id: commissionId, commission_amount_ugx: commission }, 201);
   }
 
+
+  if (path === '/admin/withdrawals' && method === 'GET') {
+    const status = url.searchParams.get('status');
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+    const result = status
+      ? await env.DB.prepare('SELECT * FROM reseller_withdrawals WHERE status = ? ORDER BY requested_at DESC LIMIT ?').bind(status, limit).all()
+      : await env.DB.prepare('SELECT * FROM reseller_withdrawals ORDER BY requested_at DESC LIMIT ?').bind(limit).all();
+    return json({ withdrawals: result.results || [] });
+  }
+
+  const withdrawalDecision = path.match(/^\\/admin\\/withdrawals\\/([^/]+)\\/decision$/);
+  if (withdrawalDecision && method === 'POST') {
+    const withdrawalId = decodeURIComponent(withdrawalDecision[1]);
+    const body = await readJson(request);
+    const decision = requireString(body.decision, 'decision', 20).toLowerCase();
+    if (!['approve', 'reject'].includes(decision)) return json({ error: 'decision must be approve or reject', code: 'VALIDATION_ERROR' }, 400);
+    const reason = decision === 'reject' ? requireString(body.reason, 'reason', 1000) : String(body.reason || '').slice(0, 1000);
+    const current = await env.DB.prepare('SELECT id,status FROM reseller_withdrawals WHERE id=?').bind(withdrawalId).first();
+    if (!current) return json({ error: 'Withdrawal not found', code: 'NOT_FOUND' }, 404);
+    if (current.status !== 'pending') return json({ error: 'Only pending withdrawals can be reviewed', code: 'CONFLICT' }, 409);
+    const nextStatus = decision === 'approve' ? 'approved' : 'rejected';
+    const result = await env.DB.prepare("UPDATE reseller_withdrawals SET status=?,decision_reason=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'")
+      .bind(nextStatus, reason || null, admin, withdrawalId).run();
+    if (!result.meta?.changes) return json({ error: 'Withdrawal was already reviewed', code: 'CONFLICT' }, 409);
+    await audit(env, admin, 'reseller_withdrawal_' + nextStatus, 'reseller_withdrawal', withdrawalId, { reason });
+    return json({ success: true, withdrawal_id: withdrawalId, status: nextStatus });
+  }
+
   return json({ error: 'Admin endpoint not found', code: 'NOT_FOUND' }, 404);
 }
 
