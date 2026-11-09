@@ -299,7 +299,7 @@ export default {
 
     try {
       // Protected admin API (Cloudflare Access identity + ADMIN_EMAILS allowlist)
-      if (path.startsWith('/admin/')) return await handleAdminRequest(request, env, url);
+      if (path.startsWith('/admin/') || path.startsWith('/api/admin/')) return await handleAdminRequest(request, env, url);
 
       // ── Health ────────────────────────────────
       if (path === '/health') return json({ status: 'ok', market: 'Uganda', time: new Date().toISOString() });
