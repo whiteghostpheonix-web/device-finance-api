@@ -1,9 +1,12 @@
-import { getAccessToken, registerIpn, listIpns, submitOrder, getTransactionStatus } from './pesapal.js';
 import { collectPayment, verifyRohoWebhook } from './rohopay.js';
 import { sendFcm } from './fcm.js';
+import { handleAdminPlansRoute } from './admin-plans.js';
+import { ensureAdminTables, getRequestAdmin, handleAdminRoute, isAdminProtectedPath } from './admin-auth.js';
+import { handleAdminWorkflowRoute } from './admin-workflows.js';
+import { handleRetailerWorkflowRoute } from './retailer-workflows.js';
 
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Origin': 'https://signal-admin.whiteghostpheonix.workers.dev',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, CF-Access-Client-Id, CF-Access-Client-Secret',
 };
@@ -295,16 +298,95 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
-    if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
+    if (request.method === 'OPTIONS') {
+      const origin = request.headers.get('Origin') || '';
+      const allowed = new Set(['https://retailers-dashboard.whiteghostpheonix.workers.dev','https://signal-retailers.whiteghostpheonix.workers.dev','https://signal-admin.whiteghostpheonix.workers.dev','https://signal-dashboard.whiteghostpheonix.workers.dev','http://localhost:5173','http://localhost:3000']);
+      return new Response(null, { headers: { ...corsHeaders, ...(allowed.has(origin) ? { 'Access-Control-Allow-Origin': origin } : {}) } });
+    }
+
+    if (path.startsWith('/api/admin/') || isAdminProtectedPath(path, request.method)) {
+      await ensureAdminTables(env);
+    }
+    const adminResponse = await handleAdminRoute(request, env);
+    if (adminResponse) return adminResponse;
+    const retailerResponse = await handleRetailerWorkflowRoute(request, env);
+    if (retailerResponse) return retailerResponse;
+    const workflowResponse = await handleAdminWorkflowRoute(request, env);
+    if (workflowResponse) return workflowResponse;
+    if (isAdminProtectedPath(path, request.method) && !(await getRequestAdmin(request, env))) {
+      return json({ error: 'Unauthorized' }, 401);
+    }
 
     try {
       // ── Health ────────────────────────────────
+      // ADMIN_DASHBOARD_READ_ROUTES_V1
+      // Read-only routes used by the current admin dashboard. Keep Cloudflare Access
+      // enabled for this API hostname; these endpoints expose customer/finance data.
+      if (path === '/api/dashboard/summary' && request.method === 'GET') {
+        const stats = await env.DB.prepare(`
+          SELECT
+            (SELECT COUNT(*) FROM devices) AS total_devices,
+            (SELECT COUNT(*) FROM devices WHERE status = 'active') AS active_devices,
+            (SELECT COUNT(*) FROM devices WHERE status = 'locked') AS locked_devices,
+            (SELECT COUNT(*) FROM schedules WHERE status = 'overdue') AS overdue_schedules,
+            (SELECT COUNT(*) FROM commands WHERE status = 'queued') AS pending_commands,
+            COALESCE((SELECT SUM(amount_paid_ugx) FROM schedules), 0) AS total_collected_ugx
+        `).first();
+        return json(stats || {});
+      }
+
+      if (path === '/api/dashboard/devices' && request.method === 'GET') {
+        const rows = await env.DB.prepare(`
+          SELECT d.*,
+            COALESCE(SUM(CASE WHEN s.status = 'paid' THEN 1 ELSE 0 END), 0) AS paid_count,
+            COUNT(s.id) AS total_count,
+            COALESCE(SUM(CASE WHEN s.status != 'paid'
+              THEN s.amount_due_ugx - COALESCE(s.amount_paid_ugx, 0) ELSE 0 END), 0) AS balance_ugx,
+            MIN(CASE WHEN s.status IN ('pending', 'overdue') THEN s.due_date END) AS next_due_date
+          FROM devices d
+          LEFT JOIN schedules s ON s.device_imei = d.imei
+          GROUP BY d.imei
+          ORDER BY d.created_at DESC
+        `).all();
+        return json(rows.results || []);
+      }
+
+      if (path.startsWith('/api/dashboard/devices/') && request.method === 'GET') {
+        const imei = decodeURIComponent(path.slice('/api/dashboard/devices/'.length));
+        if (!imei || imei.includes('/')) return json({ error: 'Invalid device identifier' }, 400);
+        const device = await env.DB.prepare('SELECT * FROM devices WHERE imei = ?').bind(imei).first();
+        if (!device) return json({ error: 'Device not found' }, 404);
+        const [schedules, commands, transactions] = await Promise.all([
+          env.DB.prepare('SELECT * FROM schedules WHERE device_imei = ? ORDER BY installment_number').bind(imei).all(),
+          env.DB.prepare('SELECT * FROM commands WHERE device_imei = ? ORDER BY created_at DESC LIMIT 50').bind(imei).all(),
+          env.DB.prepare(`SELECT t.* FROM transactions t
+            LEFT JOIN schedules s ON s.id = t.schedule_id
+            WHERE s.device_imei = ? ORDER BY t.paid_at DESC LIMIT 50`).bind(imei).all(),
+        ]);
+        return json({ device, schedules: schedules.results || [], commands: commands.results || [], transactions: transactions.results || [] });
+      }
+
+      if (path === '/api/plans' && request.method === 'GET') {
+        const rows = await env.DB.prepare(`SELECT id, plan_name, total_amount_ugx, installment_count,
+          grace_period_days, frequency, notes, amount_per_period, period_type, period_count,
+          has_deposit, deposit_amount, deposit_due_days
+          FROM payment_plans ORDER BY id DESC`).all();
+        return json(rows.results || []);
+      }
+
+      if (path === '/api/resellers' && request.method === 'GET') {
+        const rows = await env.DB.prepare(`SELECT email, name, phone, region, address, nin,
+          occupation, photo_url, id_front_url, id_back_url, created_at, updated_at
+          FROM resellers ORDER BY created_at DESC`).all();
+        return json(rows.results || []);
+      }
+
       if (path === '/health') return json({ status: 'ok', market: 'Uganda', time: new Date().toISOString() });
 
       // ── Customer payment page ────────────────────
-      // ── Customer payment: redirect to Pesapal ──
+      // ── Customer payment: RohoPay STK Push ──
       // Usage: /pay?imei=XXX  OR  /pay?code=SGXXXX
-      //   → creates a Pesapal order for the next unpaid installment
+      //   → initiates a RohoPay payment for the selected installment
       if (path === '/pay' && (request.method === 'GET' || request.method === 'HEAD')) {
         const imei = url.searchParams.get('imei') || '';
         const html = `<!DOCTYPE html>
@@ -860,6 +942,9 @@ if (REF) {
         if (!txn) return json({ status: 'pending' }); // Not in DB yet
         return json({ status: txn.status }); // 'pending', 'completed', 'failed'
       }
+
+      const adminPlansResponse = await handleAdminPlansRoute(request, env, json);
+      if (adminPlansResponse) return adminPlansResponse;
 
       return json({ error: 'Not found', path }, 404);
     } catch (error) {
