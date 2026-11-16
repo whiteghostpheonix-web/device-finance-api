@@ -337,6 +337,7 @@ export default {
     const publicApkKeys = new Map([
       ['/download/apk/signal-dpc-v0.2.1-alpha.apk', 'signal-dpc-v0.2.1-alpha.apk'],
       ['/download/apk/signal-dpc-v0.2.4.apk', 'signal-dpc-v0.2.4.apk'],
+      ['/download/apk/signal-dpc-v0.2.5.apk', 'signal-dpc-v0.2.5.apk'],
     ]);
     if (publicApkKeys.has(path) && ['GET', 'HEAD'].includes(request.method)) {
       if (!env.APK_BUCKET) return new Response('APK bucket not bound', { status: 500 });
