@@ -71,11 +71,27 @@ function response(data, status, requestOrigin) {
 }
 
 export async function ensureAdminTables(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS organizations (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'active', created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS tenant_branding (
+    org_id TEXT PRIMARY KEY, brand_name TEXT NOT NULL, logo_url TEXT,
+    primary_color TEXT NOT NULL DEFAULT '#2563eb', support_phone TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO organizations (id,name,slug,status)
+    VALUES ('org-signal-electronics','Signal Electronics','signal-electronics','active')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO tenant_branding (org_id,brand_name,primary_color)
+    VALUES ('org-signal-electronics','Signal Electronics','#2563eb')`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS admins (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1,
+    role TEXT NOT NULL DEFAULT 'SUB_ADMIN',
+    org_id TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS admin_otp_challenges (
@@ -96,8 +112,9 @@ export async function ensureAdminTables(env) {
     revoked_at TEXT,
     FOREIGN KEY (admin_id) REFERENCES admins(id)
   )`).run();
-  await env.DB.prepare(`INSERT OR IGNORE INTO admins (id, email, display_name, active)
-    VALUES ('primary-admin', ?, 'Primary Admin', 1)`).bind(INITIAL_ADMIN_EMAIL).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO admins (id, email, display_name, active, role, org_id)
+    VALUES ('primary-admin', ?, 'Primary Admin', 1, 'SUPER_ADMIN', NULL)`).bind(INITIAL_ADMIN_EMAIL).run();
+  await env.DB.prepare("UPDATE admins SET role = 'SUPER_ADMIN', org_id = NULL WHERE id = 'primary-admin'").run();
 }
 
 export async function getRequestAdmin(request, env) {
@@ -106,10 +123,13 @@ export async function getRequestAdmin(request, env) {
   const token = authorization.slice(7).trim();
   if (!/^[a-f0-9]{64}$/.test(token)) return null;
   return env.DB.prepare(`
-    SELECT a.id, a.email, a.display_name
+    SELECT a.id, a.email, a.display_name, a.role, a.org_id,
+      o.name AS organization_name, o.status AS organization_status
     FROM admin_sessions s JOIN admins a ON a.id = s.admin_id
+    LEFT JOIN organizations o ON o.id = a.org_id
     WHERE s.token_hash = ? AND s.expires_at > datetime('now')
-      AND s.revoked_at IS NULL AND a.active = 1 LIMIT 1
+      AND s.revoked_at IS NULL AND a.active = 1
+      AND (a.role = 'SUPER_ADMIN' OR (a.org_id IS NOT NULL AND o.status = 'active')) LIMIT 1
   `).bind(await sha256(token)).first();
 }
 
@@ -177,7 +197,7 @@ export async function handleAdminRoute(request, env) {
     const email = normalizeEmail(body.email);
     const otp = String(body.otp || '').trim();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !/^\d{6}$/.test(otp)) return response({ error: 'Invalid or expired code' }, 401, origin);
-    const admin = await env.DB.prepare('SELECT id, email, display_name FROM admins WHERE email = ? AND active = 1').bind(email).first();
+    const admin = await env.DB.prepare('SELECT id, email, display_name, role, org_id FROM admins WHERE email = ? AND active = 1').bind(email).first();
     if (!admin) return response({ error: 'Invalid or expired code' }, 401, origin);
     const challenge = await env.DB.prepare(`SELECT id, otp_hash, attempts FROM admin_otp_challenges
       WHERE admin_id = ? AND consumed_at IS NULL AND expires_at > datetime('now')
@@ -204,20 +224,26 @@ export async function handleAdminRoute(request, env) {
     return response({ ok: true }, 200, origin);
   }
   if (path === '/api/admin/users' && request.method === 'GET') {
-    if (!await getRequestAdmin(request, env)) return response({ error: 'Unauthorized' }, 401, origin);
-    const result = await env.DB.prepare('SELECT id, email, display_name, active, created_at FROM admins ORDER BY created_at').all();
+    const actor = await getRequestAdmin(request, env);
+    if (!actor || !['SUPER_ADMIN', 'ADMIN'].includes(actor.role)) return response({ error: 'Unauthorized' }, 401, origin);
+    const result = actor.role === 'SUPER_ADMIN'
+      ? await env.DB.prepare('SELECT id,email,display_name,active,role,org_id,created_at FROM admins ORDER BY created_at').all()
+      : await env.DB.prepare('SELECT id,email,display_name,active,role,org_id,created_at FROM admins WHERE org_id = ? ORDER BY created_at').bind(actor.org_id).all();
     return response({ users: result.results || [] }, 200, origin);
   }
   if (path === '/api/admin/users' && request.method === 'POST') {
-    if (!await getRequestAdmin(request, env)) return response({ error: 'Unauthorized' }, 401, origin);
+    const actor = await getRequestAdmin(request, env);
+    if (!actor || !['SUPER_ADMIN', 'ADMIN'].includes(actor.role)) return response({ error: 'Unauthorized' }, 401, origin);
     const body = await readJson(request);
     const email = normalizeEmail(body.email);
     const displayName = String(body.display_name || email.split('@')[0]).trim().slice(0, 100);
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return response({ error: 'Enter a valid email address' }, 400, origin);
+    // Organization admins may create only subordinate admins inside their own tenant.
+    if (actor.role !== 'ADMIN') return response({ error: 'Only an organization ADMIN can create sub-admins here' }, 403, origin);
+    const id = crypto.randomUUID();
     try {
-      const id = crypto.randomUUID();
-      await env.DB.prepare('INSERT INTO admins (id, email, display_name, active) VALUES (?, ?, ?, 1)').bind(id, email, displayName).run();
-      return response({ ok: true, admin: { id, email, display_name: displayName, active: 1 } }, 201, origin);
+      await env.DB.prepare("INSERT INTO admins (id,email,display_name,active,role,org_id) VALUES (?,?,?,1,'SUB_ADMIN',?)").bind(id,email,displayName,actor.org_id).run();
+      return response({ ok: true, admin: { id,email,display_name:displayName,active:1,role:'SUB_ADMIN',org_id:actor.org_id } }, 201, origin);
     } catch {
       return response({ error: 'Admin already exists or could not be added' }, 409, origin);
     }
