@@ -63,6 +63,34 @@ function generatePaymentCode() {
   return code;
 }
 
+function generateDeviceToken() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function hashDeviceToken(token) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function authenticateDevice(request, env) {
+  const authorization = request.headers.get('Authorization') || '';
+  const match = authorization.match(/^Bearer ([a-f0-9]{64})$/i);
+  if (!match) return null;
+  const tokenHash = await hashDeviceToken(match[1].toLowerCase());
+  return await env.DB.prepare(
+    'SELECT imei, status, allowed_apps, security_config FROM devices WHERE dpc_token_hash = ? LIMIT 1'
+  ).bind(tokenHash).first();
+}
+
+async function authenticatePaymentSession(request, env) {
+  const token = request.headers.get('X-Device-Payment-Session') || '';
+  if (!/^[a-f0-9]{64}$/i.test(token)) return null;
+  const tokenHash = await hashDeviceToken(token.toLowerCase());
+  return await env.DB.prepare(`SELECT device_imei FROM device_payment_sessions
+    WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP LIMIT 1`).bind(tokenHash).first();
+}
+
 // Find a device by payment code, IMEI, or phone number
 async function findDeviceForPayment(env, { code, phone, amount }) {
   // Try payment code first
@@ -134,6 +162,7 @@ async function dispatchPendingCommands(env, limit = 50) {
     }
     try {
       const payload = JSON.parse(cmd.payload || '{}');
+      payload.command_id = String(cmd.id);
       await sendFcm(env, cmd.fcm_token, payload);
       await env.DB.prepare(
         `UPDATE commands SET status = 'sent', sent_at = CURRENT_TIMESTAMP, attempts = attempts + 1, error_message = NULL WHERE id = ?`
@@ -248,10 +277,10 @@ async function processIncomingPayment(env, {
 
   // 6. Record a single transaction for the whole payment (attached to first schedule)
   const txResult = await env.DB.prepare(
-    `INSERT INTO transactions (schedule_id, amount_ugx, payment_method, reference, provider, provider_tx_id, provider_payload, fee_amount, net_amount)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO transactions (schedule_id, device_imei, amount_ugx, payment_method, reference, status, provider, provider_tx_id, provider_payload, fee_amount, net_amount, updated_at)
+     VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
   ).bind(
-    firstScheduleId, amount_ugx, provider, reference || provider_tx_id,
+    firstScheduleId, imei, amount_ugx, provider, reference || provider_tx_id,
     provider, provider_tx_id, JSON.stringify(raw_payload),
     fee_amount || 0, Number(amount_ugx) - (fee_amount || 0)
   ).run();
@@ -304,6 +333,25 @@ export default {
       return new Response(null, { headers: { ...corsHeaders, ...(allowed.has(origin) ? { 'Access-Control-Allow-Origin': origin } : {}) } });
     }
 
+    // Public, version-pinned Android DPC installer. Keep this before protected API routing.
+    const publicApkKeys = new Map([
+      ['/download/apk/signal-dpc-v0.2.1-alpha.apk', 'signal-dpc-v0.2.1-alpha.apk'],
+      ['/download/apk/signal-dpc-v0.2.4.apk', 'signal-dpc-v0.2.4.apk'],
+    ]);
+    if (publicApkKeys.has(path) && ['GET', 'HEAD'].includes(request.method)) {
+      if (!env.APK_BUCKET) return new Response('APK bucket not bound', { status: 500 });
+      const object = await env.APK_BUCKET.get(publicApkKeys.get(path));
+      if (!object) return new Response('APK not found', { status: 404 });
+      const headers = new Headers({
+        'Content-Type': 'application/vnd.android.package-archive',
+        'Content-Length': String(object.size),
+        'Cache-Control': 'public, max-age=3600',
+        'Content-Disposition': `attachment; filename=\"${publicApkKeys.get(path)}\"`,
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return new Response(request.method === 'HEAD' ? null : object.body, { status: 200, headers });
+    }
+
     if (path.startsWith('/api/admin/') || isAdminProtectedPath(path, request.method)) {
       await ensureAdminTables(env);
     }
@@ -318,6 +366,195 @@ export default {
     }
 
     try {
+      // DPC device-authenticated heartbeat. A per-device token is provisioned in the QR;
+      // no Cloudflare Access service credential is shipped inside the Android APK.
+      if (path === '/api/device/heartbeat' && request.method === 'POST') {
+        const device = await authenticateDevice(request, env);
+        if (!device) return json({ error: 'Invalid device credential' }, 401);
+        const body = await request.json().catch(() => ({}));
+        await env.DB.prepare(`UPDATE devices SET last_seen_at = CURRENT_TIMESTAMP,
+          manufacturer = COALESCE(?, manufacturer), model = COALESCE(?, model),
+          android_sdk = COALESCE(?, android_sdk), dpc_version = COALESCE(?, dpc_version),
+          fcm_token = COALESCE(?, fcm_token), enrollment_status = 'active'
+          WHERE imei = ?`)
+          .bind(String(body.manufacturer || '').slice(0, 80) || null,
+            String(body.model || '').slice(0, 120) || null,
+            Number.isInteger(Number(body.sdk)) ? Number(body.sdk) : null,
+            String(body.dpc_version || '').slice(0, 40) || null,
+            String(body.fcm_token || '').slice(0, 4096) || null, device.imei).run();
+        const [scheduleRows, paymentRows, current] = await Promise.all([
+          env.DB.prepare(`SELECT id, installment_number, due_date, amount_due_ugx, amount_paid_ugx, status
+            FROM schedules WHERE device_imei = ? ORDER BY installment_number`).bind(device.imei).all(),
+          env.DB.prepare(`SELECT id, amount_ugx, payment_method, reference, paid_at, status
+            FROM transactions WHERE device_imei = ? AND status = 'completed' ORDER BY paid_at DESC LIMIT 10`).bind(device.imei).all(),
+          env.DB.prepare('SELECT status, allowed_apps, security_config FROM devices WHERE imei = ?').bind(device.imei).first(),
+        ]);
+        const schedule = scheduleRows.results || [];
+        const outstanding = schedule.filter(x => x.status !== 'paid')
+          .reduce((sum, x) => sum + Number(x.amount_due_ugx || 0) - Number(x.amount_paid_ugx || 0), 0);
+        const next = schedule.find(x => x.status !== 'paid');
+        let allowedApps = [];
+        let securityConfig = {};
+        try { allowedApps = JSON.parse(current?.allowed_apps || '[]'); } catch (_) {}
+        try { securityConfig = JSON.parse(current?.security_config || '{}'); } catch (_) {}
+        return json({ ok: true, device_status: current?.status || 'active', unlock_authorized: current?.status === 'active',
+          outstanding_balance_ugx: Math.max(0, Math.round(outstanding)), next_due_date: next?.due_date || null,
+          next_due_amount_ugx: next ? Math.max(0, Number(next.amount_due_ugx || 0) - Number(next.amount_paid_ugx || 0)) : 0,
+          schedule, payment_history: paymentRows.results || [], allowed_apps: allowedApps, security_config: securityConfig,
+          update: {
+            enabled: String(env.DPC_UPDATE_ENABLED || 'false').toLowerCase() === 'true',
+            version: env.DPC_LATEST_VERSION || null,
+            version_code: Number(env.DPC_LATEST_VERSION_CODE || 0),
+            apk_url: env.DPC_APK_URL || null,
+            sha256: env.DPC_APK_SHA256 || null,
+            manifest_version: Number(env.DPC_CONFIG_VERSION || 1),
+          } });
+      }
+
+      if (path === '/api/device/payment-session' && request.method === 'POST') {
+        const device = await authenticateDevice(request, env);
+        if (!device) return json({ error: 'Invalid device credential' }, 401);
+        await env.DB.prepare('DELETE FROM device_payment_sessions WHERE expires_at <= CURRENT_TIMESTAMP').run();
+        const token = generateDeviceToken();
+        await env.DB.prepare(`INSERT INTO device_payment_sessions (token_hash, device_imei, expires_at)
+          VALUES (?, ?, datetime('now', '+15 minutes'))`).bind(await hashDeviceToken(token), device.imei).run();
+        return json({ success: true, session_token: token, expires_in_seconds: 900 });
+      }
+
+      if (path === '/api/device/ack' && request.method === 'POST') {
+        const device = await authenticateDevice(request, env);
+        if (!device) return json({ error: 'Invalid device credential' }, 401);
+        const body = await request.json().catch(() => ({}));
+        const commandId = Number(body.command_id);
+        if (!Number.isInteger(commandId) || commandId < 1) return json({ error: 'Valid command_id required' }, 400);
+        const result = await env.DB.prepare(`UPDATE commands SET status = 'acknowledged', acknowledged_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND device_imei = ? AND status IN ('sent','queued')`).bind(commandId, device.imei).run();
+        return json({ ok: true, acknowledged: Number(result.meta?.changes || 0) > 0 });
+      }
+
+      // ── Admin: register a device and optionally create its payment schedule ──
+      if (path === '/api/devices' && request.method === 'POST') {
+        const body = await request.json().catch(() => null);
+        if (!body || typeof body !== 'object') return json({ error: 'A valid JSON request body is required' }, 400);
+        const imei = String(body.imei || '').trim();
+        const customerName = String(body.customer_name || '').trim().slice(0, 160) || 'Unknown';
+        const customerPhone = String(body.customer_phone || '').trim().slice(0, 40);
+        const resellerEmail = String(body.reseller_email || '').trim().toLowerCase();
+        const planId = body.pending_plan_id ? Number(body.pending_plan_id) : null;
+        const startDate = String(body.start_date || new Date().toISOString().slice(0, 10));
+
+        // Accept a real IMEI or an Android ID used by QR provisioning; reject unsafe/ambiguous identifiers.
+        if (!/^[A-Za-z0-9._:-]{6,32}$/.test(imei)) return json({ error: 'Enter a valid IMEI or Android ID (6–32 letters or numbers)' }, 400);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate) || Number.isNaN(Date.parse(startDate + 'T00:00:00Z')) || new Date(startDate + 'T00:00:00.000Z').toISOString().slice(0, 10) !== startDate) {
+          return json({ error: 'Enter a valid first installment date' }, 400);
+        }
+        const duplicate = await env.DB.prepare('SELECT imei FROM devices WHERE imei = ?').bind(imei).first();
+        if (duplicate) return json({ error: 'This IMEI / Android ID is already registered' }, 409);
+
+        if (resellerEmail) {
+          const reseller = await env.DB.prepare('SELECT email FROM resellers WHERE lower(email) = ? LIMIT 1').bind(resellerEmail).first();
+          if (!reseller) return json({ error: 'Selected retailer is not registered. Choose an existing retailer or leave this blank.' }, 400);
+        }
+
+        let plan = null;
+        if (planId !== null) {
+          if (!Number.isInteger(planId) || planId < 1) return json({ error: 'Invalid payment plan selected' }, 400);
+          plan = await env.DB.prepare('SELECT * FROM payment_plans WHERE id = ?').bind(planId).first();
+          if (!plan) return json({ error: 'Selected payment plan was not found' }, 404);
+        }
+
+        let paymentCode = generatePaymentCode();
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const collision = await env.DB.prepare('SELECT imei FROM devices WHERE payment_code = ?').bind(paymentCode).first();
+          if (!collision) break;
+          paymentCode = generatePaymentCode();
+        }
+        const collision = await env.DB.prepare('SELECT imei FROM devices WHERE payment_code = ?').bind(paymentCode).first();
+        if (collision) return json({ error: 'Could not generate a unique payment code. Please retry.' }, 503);
+
+        const enrollmentToken = String(body.enrollment_token || generateDeviceToken()).trim().toLowerCase();
+        if (!/^[a-f0-9]{64}$/.test(enrollmentToken)) return json({ error: 'Invalid enrollment credential' }, 400);
+        const enrollmentTokenHash = await hashDeviceToken(enrollmentToken);
+        await env.DB.prepare(`INSERT INTO devices (imei, customer_name, customer_phone, status, reseller_email, payment_code, dpc_token_hash, enrollment_status)
+          VALUES (?, ?, ?, 'active', ?, ?, ?, 'pending')`)
+          .bind(imei, customerName, customerPhone || null, resellerEmail || null, paymentCode, enrollmentTokenHash).run();
+
+        let installmentsCreated = 0;
+        if (plan) {
+          const explicit = await env.DB.prepare('SELECT installment_number, offset_days, amount_ugx FROM plan_installments WHERE plan_id = ? ORDER BY installment_number').bind(planId).all();
+          let rows = explicit.results || [];
+          if (!rows.length) {
+            const count = Math.max(1, Math.min(2000, Number(plan.installment_count || plan.period_count || 1)));
+            const frequency = String(plan.frequency || plan.period_type || 'monthly').toLowerCase();
+            const stepDays = frequency.includes('week') ? 7 : frequency.includes('month') ? 0 : 1;
+            rows = [];
+            if (Number(plan.has_deposit) === 1 && Number(plan.deposit_amount) > 0) {
+              rows.push({ installment_number: 1, offset_days: Number(plan.deposit_due_days || 0), amount_ugx: Number(plan.deposit_amount) });
+            }
+            for (let i = 0; i < count; i++) {
+              const offset = stepDays === 0 ? null : i * stepDays;
+              rows.push({ installment_number: rows.length + 1, offset_days: offset, amount_ugx: Number(plan.amount_per_period || Math.ceil(Number(plan.total_amount_ugx || 0) / count)), month_index: stepDays === 0 ? i : null });
+            }
+          }
+          const base = new Date(startDate + 'T00:00:00.000Z');
+          const statements = rows.map((item, index) => {
+            const due = new Date(base);
+            if (item.month_index !== undefined && item.month_index !== null) {
+              const day = base.getUTCDate();
+              due.setUTCDate(1);
+              due.setUTCMonth(base.getUTCMonth() + item.month_index);
+              const lastDay = new Date(Date.UTC(due.getUTCFullYear(), due.getUTCMonth() + 1, 0)).getUTCDate();
+              due.setUTCDate(Math.min(day, lastDay));
+            } else due.setUTCDate(due.getUTCDate() + Number(item.offset_days || 0));
+            const number = Number(item.installment_number || index + 1);
+            return env.DB.prepare(`INSERT INTO schedules (device_imei, plan_id, installment_number, due_date, amount_due_ugx, status)
+              VALUES (?, ?, ?, ?, ?, 'pending')`).bind(imei, planId, number, due.toISOString().slice(0, 10), Number(item.amount_ugx));
+          });
+          try {
+            for (let i = 0; i < statements.length; i += 20) await env.DB.batch(statements.slice(i, i + 20));
+          } catch (scheduleError) {
+            // Registration is not complete if its selected plan schedule cannot be created.
+            // Remove only this just-created device and its partial schedule before returning an error.
+            await env.DB.prepare('DELETE FROM schedules WHERE device_imei = ?').bind(imei).run();
+            await env.DB.prepare('DELETE FROM devices WHERE imei = ?').bind(imei).run();
+            throw scheduleError;
+          }
+          installmentsCreated = statements.length;
+        }
+        await logAudit(env, 'device', imei, 'registered', { customer_name: customerName, reseller_email: resellerEmail || null, plan_id: planId, installments_created: installmentsCreated });
+        return json({ success: true, imei, payment_code: paymentCode, enrollment_token: enrollmentToken, plan_assigned: Boolean(plan), installments_created: installmentsCreated }, 201);
+      }
+
+      // Admin-managed approved app whitelist for Device Owner lock-task mode.
+      const whitelistMatch = path.match(/^\/api\/devices\/(.+)\/whitelist$/);
+      if (whitelistMatch && request.method === 'PUT') {
+        const imei = decodeURIComponent(whitelistMatch[1]);
+        const body = await request.json().catch(() => ({}));
+        const packages = Array.isArray(body.packages) ? [...new Set(body.packages.map(x => String(x).trim()))] : null;
+        if (!packages || packages.length > 30 || packages.some(x => !/^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+$/.test(x))) {
+          return json({ error: 'Provide up to 30 valid Android package IDs' }, 400);
+        }
+        const exists = await env.DB.prepare('SELECT imei FROM devices WHERE imei = ?').bind(imei).first();
+        if (!exists) return json({ error: 'Device not found' }, 404);
+        await env.DB.prepare('UPDATE devices SET allowed_apps = ? WHERE imei = ?').bind(JSON.stringify(packages), imei).run();
+        await logAudit(env, 'device', imei, 'approved_app_whitelist_updated', { packages });
+        await queueCommand(env, imei, 'REFRESH_POLICY', 'whitelist_updated');
+        return json({ success: true, packages });
+      }
+
+      // Rotate a device's one-time enrollment credential. Admin-only.
+      const enrollmentTokenMatch = path.match(/^\/api\/devices\/(.+)\/enrollment-token$/);
+      if (enrollmentTokenMatch && request.method === 'POST') {
+        const imei = decodeURIComponent(enrollmentTokenMatch[1]);
+        const exists = await env.DB.prepare('SELECT imei FROM devices WHERE imei = ?').bind(imei).first();
+        if (!exists) return json({ error: 'Device not found' }, 404);
+        const enrollmentToken = generateDeviceToken();
+        await env.DB.prepare("UPDATE devices SET dpc_token_hash = ?, enrollment_status = 'pending' WHERE imei = ?")
+          .bind(await hashDeviceToken(enrollmentToken), imei).run();
+        await logAudit(env, 'device', imei, 'enrollment_token_rotated', {});
+        return json({ success: true, enrollment_token: enrollmentToken });
+      }
+
       // ── Health ────────────────────────────────
       // ADMIN_DASHBOARD_READ_ROUTES_V1
       // Read-only routes used by the current admin dashboard. Keep Cloudflare Access
@@ -388,7 +625,13 @@ export default {
       // Usage: /pay?imei=XXX  OR  /pay?code=SGXXXX
       //   → initiates a RohoPay payment for the selected installment
       if (path === '/pay' && (request.method === 'GET' || request.method === 'HEAD')) {
-        const imei = url.searchParams.get('imei') || '';
+        const sessionToken = url.searchParams.get('session') || '';
+        if (!/^[a-f0-9]{64}$/i.test(sessionToken)) return new Response('A valid payment session is required', { status: 401 });
+        const sessionHash = await hashDeviceToken(sessionToken.toLowerCase());
+        const session = await env.DB.prepare(`SELECT device_imei FROM device_payment_sessions
+          WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP LIMIT 1`).bind(sessionHash).first();
+        if (!session) return new Response('Payment session expired. Reopen Pay from the Signal DPC app.', { status: 401 });
+        const imei = session.device_imei;
         const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -511,6 +754,8 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; marg
 
 <script>
 const IMEI = ${JSON.stringify(imei)};
+const SESSION_TOKEN = ${JSON.stringify(sessionToken)};
+const SESSION_HEADERS = { 'X-Device-Payment-Session': SESSION_TOKEN };
 let currentMode = 'single';
 let schedules = [];
 
@@ -540,7 +785,7 @@ function formatUGX(n) { return Math.round(n).toLocaleString(); }
 
 async function loadSchedules() {
   try {
-    const r = await fetch('/public/schedule?imei=' + encodeURIComponent(IMEI));
+    const r = await fetch('/public/schedule', { headers: SESSION_HEADERS });
     const data = await r.json();
     if (data.error) throw new Error(data.error);
     schedules = data.schedule || [];
@@ -633,7 +878,7 @@ async function startPayment() {
   try {
     const r = await fetch('/public/create-order', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...SESSION_HEADERS },
       body: JSON.stringify(body),
     });
     const data = await r.json();
@@ -641,7 +886,7 @@ async function startPayment() {
     if (data.error) throw new Error(data.error);
     
     // REDIRECT TO NEW PROCESSING PAGE
-    window.location.href = '/processing?amount=' + amount + '&phone=' + encodeURIComponent(phone) + '&ref=' + data.reference + '&imei=' + IMEI;
+    window.location.href = '/processing?amount=' + amount + '&phone=' + encodeURIComponent(phone) + '&ref=' + encodeURIComponent(data.reference) + '&session=' + encodeURIComponent(SESSION_TOKEN);
     
   } catch (e) {
     btn.disabled = false;
@@ -658,10 +903,11 @@ loadSchedules();
 
       // Public: Create order (Trigger STK Push via RohoPay)
       if (path === '/public/create-order' && request.method === 'POST') {
+        const paymentSession = await authenticatePaymentSession(request, env);
+        if (!paymentSession) return json({ error: 'Payment session expired. Reopen Pay from the DPC app.' }, 401);
         const body = await request.json();
-        const { device_imei, mode = 'single', custom_amount_ugx, phone } = body;
- 
-        if (!device_imei) return json({ error: 'device_imei required' }, 400);
+        const { mode = 'single', custom_amount_ugx, phone } = body;
+        const device_imei = paymentSession.device_imei;
  
         const device = await env.DB.prepare(
           `SELECT imei, customer_name, customer_phone, payment_code FROM devices WHERE imei = ?`
@@ -711,7 +957,16 @@ loadSchedules();
 
         const callbackUrl = url.origin + '/api/rohopay-callback?ref=' + merchantRef;
 
+        let transactionId = null;
         try {
+          // Persist the pending reference before requesting the STK push so a fast
+          // provider callback can always be matched to the correct device.
+          const pending = await env.DB.prepare(
+            `INSERT INTO transactions (device_imei, amount_ugx, payment_method, reference, status, provider)
+             VALUES (?, ?, 'RohoPay', ?, 'pending', 'RohoPay')`
+          ).bind(device_imei, amountToCharge, merchantRef).run();
+          transactionId = pending.meta?.last_row_id || null;
+
           await collectPayment(env, {
             phone: rawPhone,
             amount: amountToCharge,
@@ -720,17 +975,12 @@ loadSchedules();
             callbackUrl: callbackUrl,
           });
 
-          await env.DB.prepare(
-            `INSERT INTO transactions (device_imei, amount_ugx, payment_method, reference) VALUES (?, ?, ?, ?)`
-          ).bind(device_imei, amountToCharge, 'RohoPay', merchantRef).run();
-
-          return json({ 
-            success: true, 
-            message: 'STK Push sent. Check your phone to enter PIN.',
-            reference: merchantRef,
-          });
-
+          return json({ success: true, message: 'STK Push sent. Check your phone to enter PIN.', reference: merchantRef });
         } catch (err) {
+          if (transactionId) {
+            await env.DB.prepare(`UPDATE transactions SET status = 'failed', provider_payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+              .bind(String(err.message || err).slice(0, 1000), transactionId).run().catch(() => {});
+          }
           console.error('RohoPay collect error:', err);
           return json({ error: err.message || 'Failed to initiate RohoPay collection' }, 500);
         }
@@ -739,49 +989,72 @@ loadSchedules();
 if (path === '/api/rohopay-callback' && request.method === 'POST') {
         const rawBody = await request.text();
         const signature = request.headers.get('x-rohopay-signature') || '';
-        
         const isValid = await verifyRohoWebhook(env, rawBody, signature);
-        if (!isValid) {
-          console.warn('Invalid RohoPay webhook signature');
-          return json({ error: 'Invalid signature' }, 401);
-        }
+        if (!isValid) return json({ error: 'Invalid signature' }, 401);
 
         const payload = JSON.parse(rawBody);
-        console.log('RohoPay webhook success:', JSON.stringify(payload));
+        const merchantRef = String(payload.reference || payload.merchant_reference || url.searchParams.get('ref') || '');
+        const txn = await env.DB.prepare(`SELECT id, device_imei, amount_ugx, status FROM transactions WHERE reference = ? LIMIT 1`)
+          .bind(merchantRef).first();
+        if (!txn) {
+          await logAudit(env, 'payment', merchantRef || 'unknown', 'callback_unmatched', { provider: 'RohoPay' });
+          return json({ received: true, matched: false });
+        }
+        if (txn.status === 'completed') return json({ received: true, duplicate: true });
 
-        if (payload.event === 'deposit.successful' && payload.status === 'successful') {
-          const amount = payload.amount || 0;
-          const merchantRef = payload.reference;
-          
-          let deviceImei = null;
-          if (merchantRef && merchantRef.startsWith('SG-')) {
-             const parts = merchantRef.split('-');
-             if (parts.length >= 2) deviceImei = parts[1];
+        const event = String(payload.event || '').toLowerCase();
+        const providerStatus = String(payload.status || '').toLowerCase();
+        const successful = ['deposit.successful', 'payment.successful', 'charge.successful'].includes(event)
+          && ['successful', 'success', 'completed', 'paid'].includes(providerStatus);
+        if (!successful) {
+          const failed = ['failed', 'cancelled', 'canceled', 'rejected', 'expired'].includes(providerStatus);
+          if (failed) {
+            await env.DB.prepare(`UPDATE transactions SET status = 'failed', provider = 'RohoPay', provider_payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+              .bind(rawBody.slice(0, 12000), txn.id).run();
           }
-
-          if (deviceImei && amount > 0) {
-             const unpaid = await env.DB.prepare(
-              `SELECT * FROM schedules WHERE device_imei = ? AND status != 'paid' ORDER BY installment_number ASC LIMIT 1`
-             ).bind(deviceImei).first();
-
-             if (unpaid) {
-                const newPaid = (unpaid.amount_paid_ugx || 0) + amount;
-                const newStatus = newPaid >= unpaid.amount_due_ugx ? 'paid' : 'partial';
-
-                await env.DB.prepare(
-                  `UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?`
-                ).bind(newPaid, newStatus, unpaid.id).run();
-
-                await env.DB.prepare(
-                  `UPDATE transactions SET status = 'completed' WHERE reference = ?`
-                ).bind(merchantRef).run();
-
-                await sendFcm(env, deviceImei, 'UNLOCK', { reason: 'payment_received' });
-             }
-          }
+          await logAudit(env, 'payment', txn.id, 'callback_not_successful', { event, status: providerStatus });
+          return json({ received: true, payment_status: failed ? 'failed' : 'pending' });
         }
 
-        return json({ received: true });
+        const receivedAmount = Math.round(Number(payload.amount || payload.amount_ugx || 0));
+        const expectedAmount = Math.round(Number(txn.amount_ugx || 0));
+        if (!Number.isFinite(receivedAmount) || receivedAmount <= 0 || receivedAmount !== expectedAmount) {
+          await logAudit(env, 'payment', txn.id, 'callback_amount_mismatch', { expected: expectedAmount, received: receivedAmount });
+          return json({ error: 'Payment amount does not match the pending order' }, 409);
+        }
+
+        const unpaid = await env.DB.prepare(`SELECT * FROM schedules WHERE device_imei = ? AND status != 'paid' ORDER BY installment_number ASC`)
+          .bind(txn.device_imei).all();
+        let remaining = receivedAmount;
+        for (const item of unpaid.results || []) {
+          if (remaining <= 0) break;
+          const due = Number(item.amount_due_ugx || 0);
+          const alreadyPaid = Number(item.amount_paid_ugx || 0);
+          const applied = Math.min(remaining, Math.max(0, due - alreadyPaid));
+          if (applied <= 0) continue;
+          const newPaid = alreadyPaid + applied;
+          const newStatus = newPaid >= due ? 'paid' : (item.status === 'overdue' ? 'overdue' : 'pending');
+          await env.DB.prepare('UPDATE schedules SET amount_paid_ugx = ?, status = ? WHERE id = ?')
+            .bind(newPaid, newStatus, item.id).run();
+          remaining -= applied;
+        }
+
+        await env.DB.prepare(`UPDATE transactions SET status = 'completed', provider = 'RohoPay',
+          provider_tx_id = ?, provider_payload = ?, net_amount = amount_ugx - COALESCE(fee_amount, 0),
+          updated_at = CURRENT_TIMESTAMP, paid_at = CURRENT_TIMESTAMP WHERE id = ?`)
+          .bind(String(payload.transaction_id || payload.id || merchantRef).slice(0, 160), rawBody.slice(0, 12000), txn.id).run();
+
+        const overdueLeft = await env.DB.prepare(`SELECT COUNT(*) AS count FROM schedules WHERE device_imei = ? AND status = 'overdue'`)
+          .bind(txn.device_imei).first();
+        if (Number(overdueLeft?.count || 0) === 0) {
+          await env.DB.prepare(`UPDATE devices SET status = 'active' WHERE imei = ?`).bind(txn.device_imei).run();
+          await queueCommand(env, txn.device_imei, 'UNLOCK', 'payment_verified');
+        }
+        await logAudit(env, 'payment', txn.id, 'rohopay_payment_confirmed', {
+          imei: txn.device_imei, amount_ugx: receivedAmount, provider_reference: merchantRef,
+          overdue_remaining: Number(overdueLeft?.count || 0),
+        });
+        return json({ received: true, payment_status: 'completed' });
       }
 
       // Public: Processing Confirmation Page
@@ -790,6 +1063,8 @@ if (path === '/api/rohopay-callback' && request.method === 'POST') {
         const amount = url.searchParams.get('amount') || '0';
         const phone = url.searchParams.get('phone') || 'your phone';
         const ref = url.searchParams.get('ref') || '';
+        const sessionToken = url.searchParams.get('session') || '';
+        if (!/^[a-f0-9]{64}$/i.test(sessionToken)) return new Response('Payment session expired', { status: 401 });
         const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -856,13 +1131,13 @@ p { color: #94a3b8; line-height: 1.6; font-size: 15px; margin: 0 0 20px; }
 
 <script>
 const REF = ${JSON.stringify(ref)};
-const IMEI = new URLSearchParams(window.location.search).get('imei') || '';
+const SESSION_TOKEN = ${JSON.stringify(sessionToken)};
 let pollCount = 0;
 let pollInterval;
 
 // Link the return buttons to the correct IMEI
-document.getElementById('return-btn-success').href = '/pay?imei=' + IMEI;
-document.getElementById('return-btn-error').href = '/pay?imei=' + IMEI;
+document.getElementById('return-btn-success').href = 'signaldpc://payment-return';
+document.getElementById('return-btn-error').href = '/pay?session=' + encodeURIComponent(SESSION_TOKEN);
 
 function switchState(stateId) {
   document.querySelectorAll('.state-container').forEach(el => el.classList.remove('active'));
@@ -872,14 +1147,14 @@ function switchState(stateId) {
 function checkStatus() {
   pollCount++;
   
-  // If we've waited 60 seconds (20 polls * 3s), assume it failed/timed out
-  if (pollCount > 20) {
-    clearInterval(pollInterval);
-    switchState('state-error');
-    return;
+  // A slow provider callback is still pending, not proof of failure.
+  // Keep checking and never invite a duplicate charge just because of a timeout.
+  if (pollCount === 21) {
+    const note = document.querySelector('#state-loading p:last-of-type');
+    if (note) note.textContent = 'Still waiting for provider confirmation. Do not start another payment; your status will update when confirmed.';
   }
 
-  fetch('/public/payment-status/' + REF)
+  fetch('/public/payment-status/' + encodeURIComponent(REF), { headers: { 'X-Device-Payment-Session': SESSION_TOKEN } })
     .then(res => res.json())
     .then(data => {
       if (data.status === 'completed') {
@@ -896,7 +1171,7 @@ function checkStatus() {
 
 function cancelPayment() {
   clearInterval(pollInterval);
-  window.location.href = '/pay?imei=' + IMEI;
+  window.location.href = '/pay?session=' + encodeURIComponent(SESSION_TOKEN);
 }
 
 // Start polling every 3 seconds
@@ -912,8 +1187,9 @@ if (REF) {
 
       // Public: Get schedule for a specific device
       if (path === '/public/schedule' && request.method === 'GET') {
-        const imei = url.searchParams.get('imei');
-        if (!imei) return json({ error: 'IMEI required' }, 400);
+        const paymentSession = await authenticatePaymentSession(request, env);
+        if (!paymentSession) return json({ error: 'Payment session expired' }, 401);
+        const imei = paymentSession.device_imei;
         
         const device = await env.DB.prepare(
           `SELECT imei, customer_name, status FROM devices WHERE imei = ?`
@@ -934,10 +1210,12 @@ if (REF) {
 
       // Public: Check payment status
       if (path.startsWith('/public/payment-status/') && request.method === 'GET') {
-        const ref = path.split('/').pop();
+        const paymentSession = await authenticatePaymentSession(request, env);
+        if (!paymentSession) return json({ error: 'Payment session expired' }, 401);
+        const ref = decodeURIComponent(path.split('/').pop());
         const txn = await env.DB.prepare(
-          `SELECT status FROM transactions WHERE reference = ?`
-        ).bind(ref).first();
+          `SELECT status FROM transactions WHERE reference = ? AND device_imei = ?`
+        ).bind(ref, paymentSession.device_imei).first();
         
         if (!txn) return json({ status: 'pending' }); // Not in DB yet
         return json({ status: txn.status }); // 'pending', 'completed', 'failed'

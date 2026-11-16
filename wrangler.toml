@@ -18,3 +18,11 @@ bucket_name = "signal-dpc-apk"
 [[r2_buckets]]
 binding = "MEDIA_BUCKET"
 bucket_name = "signal-dpc-media"
+
+[vars]
+DPC_UPDATE_ENABLED = "true"
+DPC_LATEST_VERSION = "0.2.4"
+DPC_LATEST_VERSION_CODE = "14"
+DPC_APK_URL = "https://device-finance-api.whiteghostpheonix.workers.dev/download/apk/signal-dpc-v0.2.4.apk"
+DPC_APK_SHA256 = "e7d7805841cc2b087c1881b6918bc3a4d57fd1087e58fe003cbd70e8e1bc36b5"
+DPC_CONFIG_VERSION = "1"
